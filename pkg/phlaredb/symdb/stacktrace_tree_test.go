@@ -88,7 +88,7 @@ func Test_stacktrace_tree_encoding_group(t *testing.T) {
 }
 
 func Test_stacktrace_tree_encoding_rand(t *testing.T) {
-	// TODO: Fuzzing. With random data it's easy to hit overflow.
+	// TODO: Fuzzing.
 	nodes := make([]node, 1<<20)
 	for i := range nodes {
 		nodes[i] = node{
@@ -161,6 +161,21 @@ func Test_stacktrace_tree_pprof_locations(t *testing.T) {
 				t.Log("locations:", locs)
 				t.Fatalf("PPT: tmp[j] != locs[j]")
 			}
+		}
+	}
+}
+
+func Benchmark_stacktrace_tree_insert(b *testing.B) {
+	p, err := pprof.OpenFile("testdata/profile.pb.gz")
+	require.NoError(b, err)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		x := newStacktraceTree(0)
+		for j := range p.Sample {
+			x.insert(p.Sample[j].LocationId)
 		}
 	}
 }

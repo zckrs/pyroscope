@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"os"
+	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
 
@@ -23,8 +24,9 @@ func (c *phlareClient) pusherClient() pushv1connect.PusherServiceClient {
 
 type uploadParams struct {
 	*phlareClient
-	paths       []string
-	extraLabels map[string]string
+	paths             []string
+	extraLabels       map[string]string
+	overrideTimestamp bool
 }
 
 func addUploadParams(cmd commander) *uploadParams {
@@ -36,7 +38,8 @@ func addUploadParams(cmd commander) *uploadParams {
 	params.phlareClient = addPhlareClient(cmd)
 
 	cmd.Arg("path", "Path(s) to profile(s) to upload").Required().ExistingFilesVar(&params.paths)
-	cmd.Flag("extra-labels", "Add additional labels to the profile(s)").Default("job=profilecli-upload").StringMapVar(&params.extraLabels)
+	cmd.Flag("extra-labels", "Add additional labels to the profile(s)").StringMapVar(&params.extraLabels)
+	cmd.Flag("override-timestamp", "Set the profile timestamp to now").BoolVar(&params.overrideTimestamp)
 	return params
 }
 
@@ -66,6 +69,14 @@ func upload(ctx context.Context, params *uploadParams) (err error) {
 			return err
 		}
 
+		if params.overrideTimestamp {
+			profile.TimeNanos = time.Now().UnixNano()
+			data, err = pprof.Marshal(profile.Profile, true)
+			if err != nil {
+				return err
+			}
+		}
+
 		// detect name if no name has been set
 		if lbl.Get(model.LabelNameProfileName) == "" {
 			name := "unknown"
@@ -83,6 +94,11 @@ func upload(ctx context.Context, params *uploadParams) (err error) {
 				}
 			}
 			lblBuilder.Set(model.LabelNameProfileName, name)
+		}
+
+		// set a default service_name label if one is not provided
+		if lbl.Get(model.LabelNameServiceName) == "" {
+			lblBuilder.Set(model.LabelNameServiceName, "profilecli-upload")
 		}
 
 		series[idx] = &pushv1.RawProfileSeries{

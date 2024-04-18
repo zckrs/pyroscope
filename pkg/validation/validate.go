@@ -1,10 +1,12 @@
 package validation
 
 import (
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
@@ -30,9 +32,11 @@ const (
 	MissingLabels Reason = "missing_labels"
 	// RateLimited is one of the values for the reason to discard samples.
 	RateLimited Reason = "rate_limited"
-	// OutOfOrder is a reason for discarding profiles when Phlare doesn't accept out
-	// of order profiles.
-	OutOfOrder Reason = "out_of_order"
+
+	// NotInIngestionWindow is a reason for discarding profiles when Pyroscope doesn't accept profiles
+	// that are outside of the ingestion window.
+	NotInIngestionWindow Reason = "not_in_ingestion_window"
+
 	// MaxLabelNamesPerSeries is a reason for discarding a request which has too many label names
 	MaxLabelNamesPerSeries Reason = "max_label_names_per_series"
 	// LabelNameTooLong is a reason for discarding a request which has a label name too long
@@ -43,21 +47,28 @@ const (
 	DuplicateLabelNames Reason = "duplicate_label_names"
 	// SeriesLimit is a reason for discarding lines when we can't create a new stream
 	// because the limit of active streams has been reached.
-	SeriesLimit    Reason = "series_limit"
-	QueryLimit     Reason = "query_limit"
-	InvalidProfile Reason = "invalid_profile"
+	SeriesLimit       Reason = "series_limit"
+	QueryLimit        Reason = "query_limit"
+	SamplesLimit      Reason = "samples_limit"
+	ProfileSizeLimit  Reason = "profile_size_limit"
+	SampleLabelsLimit Reason = "sample_labels_limit"
+	MalformedProfile  Reason = "malformed_profile"
+	FlameGraphLimit   Reason = "flamegraph_limit"
 
-	SeriesLimitErrorMsg            = "Maximum active series limit exceeded (%d/%d), reduce the number of active streams (reduce labels or reduce label values), or contact your administrator to see if the limit can be increased"
-	MissingLabelsErrorMsg          = "error at least one label pair is required per profile"
-	InvalidLabelsErrorMsg          = "invalid labels '%s' with error: %s"
-	MaxLabelNamesPerSeriesErrorMsg = "profile series '%s' has %d label names; limit %d"
-	LabelNameTooLongErrorMsg       = "profile with labels '%s' has label name too long: '%s'"
-	LabelValueTooLongErrorMsg      = "profile with labels '%s' has label value too long: '%s'"
-	DuplicateLabelNamesErrorMsg    = "profile with labels '%s' has duplicate label name: '%s'"
-	QueryTooLongErrorMsg           = "the query time range exceeds the limit (query length: %s, limit: %s)"
-	ProfileTooBigErrorMsg          = "the profile with labels '%s' size exceeds the limit (profile size: %d, limit: %d)"
-	ProfileTooManySamplesErrorMsg  = "the profile with labels '%s' size exceeds the samples limit (actual: %d, limit: %d)"
-	ProfileTooManyLabelsErrorMsg   = "the profile with labels '%s' size exceeds the sample labels limit (actual: %d, limit: %d)"
+	SeriesLimitErrorMsg                 = "Maximum active series limit exceeded (%d/%d), reduce the number of active streams (reduce labels or reduce label values), or contact your administrator to see if the limit can be increased"
+	MissingLabelsErrorMsg               = "error at least one label pair is required per profile"
+	InvalidLabelsErrorMsg               = "invalid labels '%s' with error: %s"
+	MaxLabelNamesPerSeriesErrorMsg      = "profile series '%s' has %d label names; limit %d"
+	LabelNameTooLongErrorMsg            = "profile with labels '%s' has label name too long: '%s'"
+	LabelValueTooLongErrorMsg           = "profile with labels '%s' has label value too long: '%s'"
+	DuplicateLabelNamesErrorMsg         = "profile with labels '%s' has duplicate label name: '%s'"
+	QueryTooLongErrorMsg                = "the query time range exceeds the limit (max_query_length, actual: %s, limit: %s)"
+	ProfileTooBigErrorMsg               = "the profile with labels '%s' exceeds the size limit (max_profile_size_byte, actual: %d, limit: %d)"
+	ProfileTooManySamplesErrorMsg       = "the profile with labels '%s' exceeds the samples count limit (max_profile_stacktrace_samples, actual: %d, limit: %d)"
+	ProfileTooManySampleLabelsErrorMsg  = "the profile with labels '%s' exceeds the sample labels limit (max_profile_stacktrace_sample_labels, actual: %d, limit: %d)"
+	NotInIngestionWindowErrorMsg        = "profile with labels '%s' is outside of ingestion window (profile timestamp: %s, %s)"
+	MaxFlameGraphNodesErrorMsg          = "max flamegraph nodes limit %d is greater than allowed %d"
+	MaxFlameGraphNodesUnlimitedErrorMsg = "max flamegraph nodes limit must be set (max allowed %d)"
 )
 
 var (
@@ -83,19 +94,19 @@ var (
 )
 
 type LabelValidationLimits interface {
-	MaxLabelNameLength(userID string) int
-	MaxLabelValueLength(userID string) int
-	MaxLabelNamesPerSeries(userID string) int
+	MaxLabelNameLength(tenantID string) int
+	MaxLabelValueLength(tenantID string) int
+	MaxLabelNamesPerSeries(tenantID string) int
 }
 
 // ValidateLabels validates the labels of a profile.
-func ValidateLabels(limits LabelValidationLimits, userID string, ls []*typesv1.LabelPair) error {
+func ValidateLabels(limits LabelValidationLimits, tenantID string, ls []*typesv1.LabelPair) error {
 	if len(ls) == 0 {
 		return NewErrorf(MissingLabels, MissingLabelsErrorMsg)
 	}
 	sort.Sort(phlaremodel.Labels(ls))
 	numLabelNames := len(ls)
-	maxLabels := limits.MaxLabelNamesPerSeries(userID)
+	maxLabels := limits.MaxLabelNamesPerSeries(tenantID)
 	if numLabelNames > maxLabels {
 		return NewErrorf(MaxLabelNamesPerSeries, MaxLabelNamesPerSeriesErrorMsg, phlaremodel.LabelPairsString(ls), numLabelNames, maxLabels)
 	}
@@ -110,9 +121,9 @@ func ValidateLabels(limits LabelValidationLimits, userID string, ls []*typesv1.L
 	lastLabelName := ""
 
 	for _, l := range ls {
-		if len(l.Name) > limits.MaxLabelNameLength(userID) {
+		if len(l.Name) > limits.MaxLabelNameLength(tenantID) {
 			return NewErrorf(LabelNameTooLong, LabelNameTooLongErrorMsg, phlaremodel.LabelPairsString(ls), l.Name)
-		} else if len(l.Value) > limits.MaxLabelValueLength(userID) {
+		} else if len(l.Value) > limits.MaxLabelValueLength(tenantID) {
 			return NewErrorf(LabelValueTooLong, LabelValueTooLongErrorMsg, phlaremodel.LabelPairsString(ls), l.Value)
 		} else if !model.LabelName(l.Name).IsValid() {
 			return NewErrorf(InvalidLabels, InvalidLabelsErrorMsg, phlaremodel.LabelPairsString(ls), "invalid label name '"+l.Name+"'")
@@ -128,41 +139,110 @@ func ValidateLabels(limits LabelValidationLimits, userID string, ls []*typesv1.L
 }
 
 type ProfileValidationLimits interface {
-	MaxProfileSizeBytes(userID string) int
-	MaxProfileStacktraceSamples(userID string) int
-	MaxProfileStacktraceSampleLabels(userID string) int
-	MaxProfileStacktraceDepth(userID string) int
-	MaxProfileSymbolValueLength(userID string) int
+	MaxProfileSizeBytes(tenantID string) int
+	MaxProfileStacktraceSamples(tenantID string) int
+	MaxProfileStacktraceSampleLabels(tenantID string) int
+	MaxProfileStacktraceDepth(tenantID string) int
+	MaxProfileSymbolValueLength(tenantID string) int
+	RejectNewerThan(tenantID string) time.Duration
+	RejectOlderThan(tenantID string) time.Duration
 }
 
-func ValidateProfile(limits ProfileValidationLimits, userID string, prof *googlev1.Profile, uncompressedSize int, ls phlaremodel.Labels) error {
+type ingestionWindow struct {
+	from, to model.Time
+}
+
+func newIngestionWindow(limits ProfileValidationLimits, tenantID string, now model.Time) *ingestionWindow {
+	var iw ingestionWindow
+	if d := limits.RejectNewerThan(tenantID); d != 0 {
+		iw.to = now.Add(d)
+	}
+	if d := limits.RejectOlderThan(tenantID); d != 0 {
+		iw.from = now.Add(-d)
+	}
+	return &iw
+}
+
+func (iw *ingestionWindow) errorDetail() string {
+	if iw.to == 0 {
+		return fmt.Sprintf("the ingestion window starts at %s", util.FormatTimeMillis(int64(iw.from)))
+	}
+	if iw.from == 0 {
+		return fmt.Sprintf("the ingestion window ends at %s", util.FormatTimeMillis(int64(iw.to)))
+	}
+	return fmt.Sprintf("the ingestion window starts at %s and ends at %s", util.FormatTimeMillis(int64(iw.from)), util.FormatTimeMillis(int64(iw.to)))
+
+}
+
+func (iw *ingestionWindow) valid(t model.Time, ls phlaremodel.Labels) error {
+	if (iw.from == 0 || t.After(iw.from)) && (iw.to == 0 || t.Before(iw.to)) {
+		return nil
+	}
+
+	return NewErrorf(NotInIngestionWindow, NotInIngestionWindowErrorMsg, phlaremodel.LabelPairsString(ls), util.FormatTimeMillis(int64(t)), iw.errorDetail())
+}
+
+func ValidateProfile(limits ProfileValidationLimits, tenantID string, prof *googlev1.Profile, uncompressedSize int, ls phlaremodel.Labels, now model.Time) error {
 	if prof == nil {
 		return nil
 	}
-	if limit := limits.MaxProfileSizeBytes(userID); limit != 0 && uncompressedSize > limit {
-		return NewErrorf(InvalidProfile, ProfileTooBigErrorMsg, phlaremodel.LabelPairsString(ls), uncompressedSize, limit)
+
+	if prof.TimeNanos > 0 {
+		// check profile timestamp within ingestion window
+		if err := newIngestionWindow(limits, tenantID, now).valid(model.TimeFromUnixNano(prof.TimeNanos), ls); err != nil {
+			return err
+		}
+	} else {
+		prof.TimeNanos = now.UnixNano()
 	}
-	if limit, size := limits.MaxProfileStacktraceSamples(userID), len(prof.Sample); limit != 0 && size > limit {
-		return NewErrorf(InvalidProfile, ProfileTooManySamplesErrorMsg, phlaremodel.LabelPairsString(ls), size, limit)
+
+	if limit := limits.MaxProfileSizeBytes(tenantID); limit != 0 && uncompressedSize > limit {
+		return NewErrorf(ProfileSizeLimit, ProfileTooBigErrorMsg, phlaremodel.LabelPairsString(ls), uncompressedSize, limit)
+	}
+	if limit, size := limits.MaxProfileStacktraceSamples(tenantID), len(prof.Sample); limit != 0 && size > limit {
+		return NewErrorf(SamplesLimit, ProfileTooManySamplesErrorMsg, phlaremodel.LabelPairsString(ls), size, limit)
 	}
 	var (
-		depthLimit        = limits.MaxProfileStacktraceDepth(userID)
-		labelsLimit       = limits.MaxProfileStacktraceSampleLabels(userID)
-		symbolLengthLimit = limits.MaxProfileSymbolValueLength(userID)
+		depthLimit        = limits.MaxProfileStacktraceDepth(tenantID)
+		labelsLimit       = limits.MaxProfileStacktraceSampleLabels(tenantID)
+		symbolLengthLimit = limits.MaxProfileSymbolValueLength(tenantID)
 	)
 	for _, s := range prof.Sample {
-
 		if depthLimit != 0 && len(s.LocationId) > depthLimit {
-			// truncate the deepest frames
-			s.LocationId = s.LocationId[:depthLimit]
+			// Truncate the deepest frames: s.LocationId[0] is the leaf.
+			s.LocationId = s.LocationId[len(s.LocationId)-depthLimit:]
 		}
 		if labelsLimit != 0 && len(s.Label) > labelsLimit {
-			return NewErrorf(InvalidProfile, ProfileTooManyLabelsErrorMsg, phlaremodel.LabelPairsString(ls), len(s.Label), labelsLimit)
+			return NewErrorf(SampleLabelsLimit, ProfileTooManySampleLabelsErrorMsg, phlaremodel.LabelPairsString(ls), len(s.Label), labelsLimit)
 		}
 	}
-	for i := range prof.StringTable {
-		if symbolLengthLimit != 0 && len(prof.StringTable[i]) > symbolLengthLimit {
-			prof.StringTable[i] = prof.StringTable[i][len(prof.StringTable[i])-symbolLengthLimit:]
+	if symbolLengthLimit > 0 {
+		for i := range prof.StringTable {
+			if len(prof.StringTable[i]) > symbolLengthLimit {
+				prof.StringTable[i] = prof.StringTable[i][len(prof.StringTable[i])-symbolLengthLimit:]
+			}
+		}
+	}
+	for _, location := range prof.Location {
+		if location.Id == 0 {
+			return NewErrorf(MalformedProfile, "location id is 0")
+		}
+	}
+	for _, function := range prof.Function {
+		if function.Id == 0 {
+			return NewErrorf(MalformedProfile, "function id is 0")
+		}
+	}
+	for _, valueType := range prof.SampleType {
+		stt := prof.StringTable[valueType.Type]
+		if strings.Contains(stt, "-") {
+			return NewErrorf(MalformedProfile, "sample type contains -")
+		}
+		// todo check if sample type is valid from the promql parser perspective
+	}
+	for _, s := range prof.StringTable {
+		if !utf8.ValidString(s) {
+			return NewErrorf(MalformedProfile, "invalid utf8 string hex: %s", hex.EncodeToString([]byte(s)))
 		}
 	}
 	return nil
@@ -243,4 +323,25 @@ func ValidateRangeRequest(limits RangeRequestLimits, tenantIDs []string, req mod
 	}
 
 	return ValidatedRangeRequest{Interval: req}, nil
+}
+
+type FlameGraphLimits interface {
+	MaxFlameGraphNodesDefault(string) int
+	MaxFlameGraphNodesMax(string) int
+}
+
+func ValidateMaxNodes(l FlameGraphLimits, tenantIDs []string, n int64) (int64, error) {
+	if n == 0 {
+		return int64(validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, l.MaxFlameGraphNodesDefault)), nil
+	}
+	maxNodes := int64(validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, l.MaxFlameGraphNodesMax))
+	if maxNodes != 0 {
+		if n > maxNodes {
+			return 0, NewErrorf(FlameGraphLimit, MaxFlameGraphNodesErrorMsg, n, maxNodes)
+		}
+		if n < 0 {
+			return 0, NewErrorf(FlameGraphLimit, MaxFlameGraphNodesUnlimitedErrorMsg, maxNodes)
+		}
+	}
+	return n, nil
 }

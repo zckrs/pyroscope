@@ -1,19 +1,7 @@
-const HtmlWebpackPlugin = require('html-webpack-plugin');
+const CopyWebpackPlugin = require('copy-webpack-plugin');
+
 const path = require('path');
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
-const {
-  dependencies: pyroOSSDeps,
-} = require('../../node_modules/pyroscope-oss/package.json');
-const webpack = require('webpack');
-const TsconfigPathsPlugin = require('tsconfig-paths-webpack-plugin');
-
-// this is so that we don't import dependencies twice, once from pyroscope-oss and another from here
-const deps = Object.entries(pyroOSSDeps).reduce((prev, [name]) => {
-  return {
-    ...prev,
-    [name]: path.resolve(__dirname, `../../node_modules/${name}`),
-  };
-}, {});
 
 module.exports = {
   target: 'web',
@@ -35,91 +23,12 @@ module.exports = {
     // For example, setting a) '@webapp/*' and  b) '@webapp/components/ExportData'
     // Would end up ignoring b)
     alias: {
-      // Specific Component overrides
-      '@webapp/components/ExportData': path.resolve(
-        __dirname,
-        '../../public/app/overrides/components/ExportData'
-      ),
-      '@webapp/components/TimelineChart/ContextMenu.plugin': path.resolve(
-        __dirname,
-        '../../public/app/overrides/components/TimelineChart/ContextMenu.plugin'
-      ),
-      '@webapp/components/AppSelector/Label': path.resolve(
-        __dirname,
-        '../../public/app/overrides/components/AppSelector/Label'
-      ),
-      '@webapp/components/AppSelector': path.resolve(
-        __dirname,
-        '../../public/app/overrides/components/AppSelector/AppSelector'
-      ),
-      '@webapp/components/Toolbar': path.resolve(
-        __dirname,
-        '../../public/app/overrides/components/Toolbar'
-      ),
-      '@webapp/ui/Sidebar': path.resolve(
-        __dirname,
-        '../../public/app/overrides/ui/Sidebar'
-      ),
-      '@webapp/util/baseurl': path.resolve(
-        __dirname,
-        '../../public/app/overrides/util/baseurl'
-      ),
-
-      '@webapp/redux/store': path.resolve(
-        __dirname,
-        '../../public/app/redux/store'
-      ),
-      '@webapp/redux/hooks': path.resolve(
-        __dirname,
-        '../../public/app/redux/hooks'
-      ),
-      '@webapp/models/query': path.resolve(
-        __dirname,
-        '../../public/app/overrides/models/query'
-      ),
-      '@webapp/models/app': path.resolve(
-        __dirname,
-        '../../public/app/overrides/models/app'
-      ),
-      '@webapp/services/apps': path.resolve(
-        __dirname,
-        '../../public/app/overrides/services/apps'
-      ),
-      '@webapp/services/render': path.resolve(
-        __dirname,
-        '../../public/app/overrides/services/render'
-      ),
-      '@webapp/services/tags': path.resolve(
-        __dirname,
-        '../../public/app/overrides/services/tags'
-      ),
-      '@webapp/services/base': path.resolve(
-        __dirname,
-        '../../public/app/overrides/services/base'
-      ),
-
-      // Common
-      '@pyroscope/webapp': path.resolve(
-        __dirname,
-        '../../node_modules/pyroscope-oss/webapp'
-      ),
-      '@pyroscope/flamegraph': path.resolve(
-        __dirname,
-        '../../node_modules/pyroscope-oss/packages/pyroscope-flamegraph'
-      ),
-      '@pyroscope/models': path.resolve(
-        __dirname,
-        '../../node_modules/pyroscope-oss/packages/pyroscope-models'
-      ),
-
-      '@webapp': path.resolve(
-        __dirname,
-        '../../node_modules/pyroscope-oss/webapp/javascript'
-      ),
-
-      '@phlare': path.resolve(__dirname, '../../public/app'),
+      '@pyroscope': path.resolve(__dirname, '../../public/app'),
+      // some sub-dependencies use a different version of @emotion/react and generate warnings
+      // in the browser about @emotion/react loaded twice. We want to only load it once
+      '@emotion/react': require.resolve('@emotion/react'),
       // Dependencies
-      ...deps,
+      //...deps,
     },
     plugins: [
       // Use same alias from tsconfig.json
@@ -138,6 +47,14 @@ module.exports = {
   plugins: [
     new MiniCssExtractPlugin({
       filename: '[name].[contenthash].css',
+    }),
+    new CopyWebpackPlugin({
+      patterns: [
+        {
+          from: 'node_modules/@grafana/ui/dist/public/img/icons',
+          to: 'grafana/img/icons/',
+        },
+      ],
     }),
   ],
   module: {
@@ -171,7 +88,7 @@ module.exports = {
       {
         test: /\.(js|ts)x?$/,
         // Ignore everything except pyroscope-oss, since it's used as if it was local code
-        exclude: /node_modules\/(?!pyroscope-oss).*/,
+        // exclude: /node_modules\/(?!pyroscope-oss).*/,
         use: [
           {
             loader: 'esbuild-loader',

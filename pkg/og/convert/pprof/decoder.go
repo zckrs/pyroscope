@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"compress/gzip"
 	"fmt"
-	"github.com/grafana/pyroscope/pkg/og/convert/pprof/streaming"
 	"io"
+
+	"github.com/valyala/bytebufferpool"
 
 	"github.com/grafana/pyroscope/pkg/og/storage/tree"
 )
+
+var bufPool = bytebufferpool.Pool{}
 
 func Decode(r io.Reader, p *tree.Profile) error {
 	br := bufio.NewReader(r)
@@ -26,8 +29,8 @@ func Decode(r io.Reader, p *tree.Profile) error {
 	} else {
 		r = br
 	}
-	buf := streaming.PPROFBufPool.Get()
-	defer streaming.PPROFBufPool.Put(buf)
+	buf := bufPool.Get()
+	defer bufPool.Put(buf)
 	if _, err = io.Copy(buf, r); err != nil {
 		return err
 	}

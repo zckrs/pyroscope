@@ -1,0 +1,19 @@
+---
+version: '3.9'
+services:
+  pyroscope:
+    image: grafana/pyroscope
+    ports:
+      - '4040:4040'
+
+  app-glibc:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  app-musl:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: musl.Dockerfile

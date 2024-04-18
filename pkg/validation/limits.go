@@ -3,15 +3,22 @@ package validation
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"gopkg.in/yaml.v3"
+
+	"github.com/grafana/pyroscope/pkg/phlaredb/block"
 )
 
 const (
 	bytesInMB = 1048576
+
+	// MinCompactorPartialBlockDeletionDelay is the minimum partial blocks deletion delay that can be configured in Mimir.
+	// Partial blocks are blocks that are not having meta file uploaded yet.
+	MinCompactorPartialBlockDeletionDelay = 4 * time.Hour
 )
 
 // Limits describe all the limits for tenants; can be used to describe global default
@@ -25,12 +32,17 @@ type Limits struct {
 	MaxLabelNameLength     int     `yaml:"max_label_name_length" json:"max_label_name_length"`
 	MaxLabelValueLength    int     `yaml:"max_label_value_length" json:"max_label_value_length"`
 	MaxLabelNamesPerSeries int     `yaml:"max_label_names_per_series" json:"max_label_names_per_series"`
+	MaxSessionsPerSeries   int     `yaml:"max_sessions_per_series" json:"max_sessions_per_series"`
 
 	MaxProfileSizeBytes              int `yaml:"max_profile_size_bytes" json:"max_profile_size_bytes"`
 	MaxProfileStacktraceSamples      int `yaml:"max_profile_stacktrace_samples" json:"max_profile_stacktrace_samples"`
 	MaxProfileStacktraceSampleLabels int `yaml:"max_profile_stacktrace_sample_labels" json:"max_profile_stacktrace_sample_labels"`
 	MaxProfileStacktraceDepth        int `yaml:"max_profile_stacktrace_depth" json:"max_profile_stacktrace_depth"`
 	MaxProfileSymbolValueLength      int `yaml:"max_profile_symbol_value_length" json:"max_profile_symbol_value_length"`
+
+	// Distributor aggregation.
+	DistributorAggregationWindow model.Duration `yaml:"distributor_aggregation_window" json:"distributor_aggregation_window"`
+	DistributorAggregationPeriod model.Duration `yaml:"distributor_aggregation_period" json:"distributor_aggregation_period"`
 
 	// The tenant shard size determines the how many ingesters a particular
 	// tenant will be sharded to. Needs to be specified on distributors for
@@ -47,11 +59,34 @@ type Limits struct {
 	MaxQueryLength      model.Duration `yaml:"max_query_length" json:"max_query_length"`
 	MaxQueryParallelism int            `yaml:"max_query_parallelism" json:"max_query_parallelism"`
 
+	// Flame graph enforced limits.
+	MaxFlameGraphNodesDefault int `yaml:"max_flamegraph_nodes_default" json:"max_flamegraph_nodes_default"`
+	MaxFlameGraphNodesMax     int `yaml:"max_flamegraph_nodes_max" json:"max_flamegraph_nodes_max"`
+
 	// Store-gateway.
 	StoreGatewayTenantShardSize int `yaml:"store_gateway_tenant_shard_size" json:"store_gateway_tenant_shard_size"`
 
 	// Query frontend.
 	QuerySplitDuration model.Duration `yaml:"split_queries_by_interval" json:"split_queries_by_interval"`
+
+	// Compactor.
+	CompactorBlocksRetentionPeriod     model.Duration `yaml:"compactor_blocks_retention_period" json:"compactor_blocks_retention_period"`
+	CompactorSplitAndMergeShards       int            `yaml:"compactor_split_and_merge_shards" json:"compactor_split_and_merge_shards"`
+	CompactorSplitAndMergeStageSize    int            `yaml:"compactor_split_and_merge_stage_size" json:"compactor_split_and_merge_stage_size"`
+	CompactorSplitGroups               int            `yaml:"compactor_split_groups" json:"compactor_split_groups"`
+	CompactorTenantShardSize           int            `yaml:"compactor_tenant_shard_size" json:"compactor_tenant_shard_size"`
+	CompactorPartialBlockDeletionDelay model.Duration `yaml:"compactor_partial_block_deletion_delay" json:"compactor_partial_block_deletion_delay"`
+	CompactorDownsamplerEnabled        bool           `yaml:"compactor_downsampler_enabled" json:"compactor_downsampler_enabled"`
+
+	// This config doesn't have a CLI flag registered here because they're registered in
+	// their own original config struct.
+	S3SSEType                 string `yaml:"s3_sse_type" json:"s3_sse_type" doc:"nocli|description=S3 server-side encryption type. Required to enable server-side encryption overrides for a specific tenant. If not set, the default S3 client settings are used."`
+	S3SSEKMSKeyID             string `yaml:"s3_sse_kms_key_id" json:"s3_sse_kms_key_id" doc:"nocli|description=S3 server-side encryption KMS Key ID. Ignored if the SSE type override is not set."`
+	S3SSEKMSEncryptionContext string `yaml:"s3_sse_kms_encryption_context" json:"s3_sse_kms_encryption_context" doc:"nocli|description=S3 server-side encryption KMS encryption context. If unset and the key ID override is set, the encryption context will not be provided to S3. Ignored if the SSE type override is not set."`
+
+	// Ensure profiles are dated within the IngestionWindow of the distributor.
+	RejectOlderThan model.Duration `yaml:"reject_older_than" json:"reject_older_than"`
+	RejectNewerThan model.Duration `yaml:"reject_newer_than" json:"reject_newer_than"`
 }
 
 // LimitError are errors that do not comply with the limits specified.
@@ -71,6 +106,7 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.MaxLabelNameLength, "validation.max-length-label-name", 1024, "Maximum length accepted for label names.")
 	f.IntVar(&l.MaxLabelValueLength, "validation.max-length-label-value", 2048, "Maximum length accepted for label value. This setting also applies to the metric name.")
 	f.IntVar(&l.MaxLabelNamesPerSeries, "validation.max-label-names-per-series", 30, "Maximum number of label names per series.")
+	f.IntVar(&l.MaxSessionsPerSeries, "validation.max-sessions-per-series", 0, "Maximum number of sessions per series. 0 to disable.")
 
 	f.IntVar(&l.MaxLocalSeriesPerTenant, "ingester.max-local-series-per-tenant", 0, "Maximum number of active series of profiles per tenant, per ingester. 0 to disable.")
 	f.IntVar(&l.MaxGlobalSeriesPerTenant, "ingester.max-global-series-per-tenant", 5000, "Maximum number of active series of profiles per tenant, across the cluster. 0 to disable. When the global limit is enabled, each ingester is configured with a dynamic local limit based on the replication factor and the current number of healthy ingesters, and is kept updated whenever the number of ingesters change.")
@@ -89,10 +125,31 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.MaxQueryParallelism, "querier.max-query-parallelism", 0, "Maximum number of queries that will be scheduled in parallel by the frontend.")
 
 	f.IntVar(&l.MaxProfileSizeBytes, "validation.max-profile-size-bytes", 4*1024*1024, "Maximum size of a profile in bytes. This is based off the uncompressed size. 0 to disable.")
-	f.IntVar(&l.MaxProfileStacktraceSamples, "validation.max-profile-stacktrace-samples", 4000, "Maximum number of samples in a profile. 0 to disable.")
+	f.IntVar(&l.MaxProfileStacktraceSamples, "validation.max-profile-stacktrace-samples", 16000, "Maximum number of samples in a profile. 0 to disable.")
 	f.IntVar(&l.MaxProfileStacktraceSampleLabels, "validation.max-profile-stacktrace-sample-labels", 100, "Maximum number of labels in a profile sample. 0 to disable.")
 	f.IntVar(&l.MaxProfileStacktraceDepth, "validation.max-profile-stacktrace-depth", 1000, "Maximum depth of a profile stacktrace. Profiles are not rejected instead stacktraces are truncated. 0 to disable.")
-	f.IntVar(&l.MaxProfileSymbolValueLength, "validation.max-profile-symbol-value-length", 1024, "Maximum length of a profile symbol value (labels, function names and filenames, etc...). Profiles are not rejected instead symbol values are truncated. 0 to disable.")
+	f.IntVar(&l.MaxProfileSymbolValueLength, "validation.max-profile-symbol-value-length", 65535, "Maximum length of a profile symbol value (labels, function names and filenames, etc...). Profiles are not rejected instead symbol values are truncated. 0 to disable.")
+
+	f.IntVar(&l.MaxFlameGraphNodesDefault, "querier.max-flamegraph-nodes-default", 8<<10, "Maximum number of flame graph nodes by default. 0 to disable.")
+	f.IntVar(&l.MaxFlameGraphNodesMax, "querier.max-flamegraph-nodes-max", 0, "Maximum number of flame graph nodes allowed. 0 to disable.")
+
+	f.Var(&l.DistributorAggregationWindow, "distributor.aggregation-window", "Duration of the distributor aggregation window. Requires aggregation period to be specified. 0 to disable.")
+	f.Var(&l.DistributorAggregationPeriod, "distributor.aggregation-period", "Duration of the distributor aggregation period. Requires aggregation window to be specified. 0 to disable.")
+
+	f.Var(&l.CompactorBlocksRetentionPeriod, "compactor.blocks-retention-period", "Delete blocks containing samples older than the specified retention period. 0 to disable.")
+	f.IntVar(&l.CompactorSplitAndMergeShards, "compactor.split-and-merge-shards", 0, "The number of shards to use when splitting blocks. 0 to disable splitting.")
+	f.IntVar(&l.CompactorSplitAndMergeStageSize, "compactor.split-and-merge-stage-size", 0, "Number of stages split shards will be written to. Number of output split shards is controlled by -compactor.split-and-merge-shards.")
+	f.IntVar(&l.CompactorSplitGroups, "compactor.split-groups", 1, "Number of groups that blocks for splitting should be grouped into. Each group of blocks is then split separately. Number of output split shards is controlled by -compactor.split-and-merge-shards.")
+	f.IntVar(&l.CompactorTenantShardSize, "compactor.compactor-tenant-shard-size", 0, "Max number of compactors that can compact blocks for single tenant. 0 to disable the limit and use all compactors.")
+	_ = l.CompactorPartialBlockDeletionDelay.Set("1d")
+	f.Var(&l.CompactorPartialBlockDeletionDelay, "compactor.partial-block-deletion-delay", fmt.Sprintf("If a partial block (unfinished block without %s file) hasn't been modified for this time, it will be marked for deletion. The minimum accepted value is %s: a lower value will be ignored and the feature disabled. 0 to disable.", block.MetaFilename, MinCompactorPartialBlockDeletionDelay.String()))
+	f.BoolVar(&l.CompactorDownsamplerEnabled, "compactor.compactor-downsampler-enabled", true, "If enabled, the compactor will downsample profiles in blocks at compaction level 3 and above. The original profiles are also kept.")
+
+	_ = l.RejectNewerThan.Set("10m")
+	f.Var(&l.RejectNewerThan, "validation.reject-newer-than", "This limits how far into the future profiling data can be ingested. This limit is enforced in the distributor. 0 to disable, defaults to 10m.")
+
+	_ = l.RejectOlderThan.Set("1h")
+	f.Var(&l.RejectOlderThan, "validation.reject-older-than", "This limits how far into the past profiling data can be ingested. This limit is enforced in the distributor. 0 to disable, defaults to 1h.")
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -219,6 +276,19 @@ func (o *Overrides) MaxProfileSymbolValueLength(tenantID string) int {
 	return o.getOverridesForTenant(tenantID).MaxProfileSymbolValueLength
 }
 
+// MaxSessionsPerSeries returns the maximum number of sessions per single series.
+func (o *Overrides) MaxSessionsPerSeries(tenantID string) int {
+	return o.getOverridesForTenant(tenantID).MaxSessionsPerSeries
+}
+
+func (o *Overrides) DistributorAggregationWindow(tenantID string) model.Duration {
+	return o.getOverridesForTenant(tenantID).DistributorAggregationWindow
+}
+
+func (o *Overrides) DistributorAggregationPeriod(tenantID string) model.Duration {
+	return o.getOverridesForTenant(tenantID).DistributorAggregationPeriod
+}
+
 // MaxLocalSeriesPerTenant returns the maximum number of series a tenant is allowed to store
 // in a single ingester.
 func (o *Overrides) MaxLocalSeriesPerTenant(tenantID string) int {
@@ -247,6 +317,16 @@ func (o *Overrides) MaxQueryLookback(tenantID string) time.Duration {
 	return time.Duration(o.getOverridesForTenant(tenantID).MaxQueryLookback)
 }
 
+// MaxFlameGraphNodesDefault returns the max flame graph nodes used by default.
+func (o *Overrides) MaxFlameGraphNodesDefault(tenantID string) int {
+	return o.getOverridesForTenant(tenantID).MaxFlameGraphNodesDefault
+}
+
+// MaxFlameGraphNodesMax returns the max flame graph nodes allowed.
+func (o *Overrides) MaxFlameGraphNodesMax(tenantID string) int {
+	return o.getOverridesForTenant(tenantID).MaxFlameGraphNodesMax
+}
+
 // StoreGatewayTenantShardSize returns the store-gateway shard size for a given user.
 func (o *Overrides) StoreGatewayTenantShardSize(userID string) int {
 	return o.getOverridesForTenant(userID).StoreGatewayTenantShardSize
@@ -257,10 +337,79 @@ func (o *Overrides) QuerySplitDuration(tenantID string) time.Duration {
 	return time.Duration(o.getOverridesForTenant(tenantID).QuerySplitDuration)
 }
 
+// CompactorTenantShardSize returns number of compactors that this user can use. 0 = all compactors.
+func (o *Overrides) CompactorTenantShardSize(userID string) int {
+	return o.getOverridesForTenant(userID).CompactorTenantShardSize
+}
+
+// CompactorBlocksRetentionPeriod returns the retention period for a given user.
+func (o *Overrides) CompactorBlocksRetentionPeriod(userID string) time.Duration {
+	return time.Duration(o.getOverridesForTenant(userID).CompactorBlocksRetentionPeriod)
+}
+
+// CompactorSplitAndMergeShards returns the number of shards to use when splitting blocks.
+func (o *Overrides) CompactorSplitAndMergeShards(userID string) int {
+	return o.getOverridesForTenant(userID).CompactorSplitAndMergeShards
+}
+
+// CompactorSplitAndMergeStageSize returns the number of stages split shards will be written to.
+func (o *Overrides) CompactorSplitAndMergeStageSize(userID string) int {
+	return o.getOverridesForTenant(userID).CompactorSplitAndMergeStageSize
+}
+
+// CompactorSplitGroups returns the number of groups that blocks for splitting should be grouped into.
+func (o *Overrides) CompactorSplitGroups(userID string) int {
+	return o.getOverridesForTenant(userID).CompactorSplitGroups
+}
+
+// CompactorPartialBlockDeletionDelay returns the partial block deletion delay time period for a given user,
+// and whether the configured value was valid. If the value wasn't valid, the returned delay is the default one
+// and the caller is responsible to warn the Mimir operator about it.
+func (o *Overrides) CompactorPartialBlockDeletionDelay(userID string) (delay time.Duration, valid bool) {
+	delay = time.Duration(o.getOverridesForTenant(userID).CompactorPartialBlockDeletionDelay)
+
+	// Forcefully disable partial blocks deletion if the configured delay is too low.
+	if delay > 0 && delay < MinCompactorPartialBlockDeletionDelay {
+		return 0, false
+	}
+
+	return delay, true
+}
+
+// CompactorDownsamplerEnabled returns true if the downsampler is enabled for a given user.
+func (o *Overrides) CompactorDownsamplerEnabled(userId string) bool {
+	return o.getOverridesForTenant(userId).CompactorDownsamplerEnabled
+}
+
+// S3SSEType returns the per-tenant S3 SSE type.
+func (o *Overrides) S3SSEType(user string) string {
+	return o.getOverridesForTenant(user).S3SSEType
+}
+
+// S3SSEKMSKeyID returns the per-tenant S3 KMS-SSE key id.
+func (o *Overrides) S3SSEKMSKeyID(user string) string {
+	return o.getOverridesForTenant(user).S3SSEKMSKeyID
+}
+
+// S3SSEKMSEncryptionContext returns the per-tenant S3 KMS-SSE encryption context.
+func (o *Overrides) S3SSEKMSEncryptionContext(user string) string {
+	return o.getOverridesForTenant(user).S3SSEKMSEncryptionContext
+}
+
 // MaxQueriersPerTenant returns the limit to the number of queriers that can be used
 // Shuffle sharding will be used to distribute queries across queriers.
 // 0 means no limit. Currently disabled.
 func (o *Overrides) MaxQueriersPerTenant(tenant string) int { return 0 }
+
+// RejectNewerThan will ensure that profiles are further than the return value into the future are reject.
+func (o *Overrides) RejectNewerThan(tenantID string) time.Duration {
+	return time.Duration(o.getOverridesForTenant(tenantID).RejectNewerThan)
+}
+
+// RejectOlderThan will ensure that profiles that are older than the return value are rejected.
+func (o *Overrides) RejectOlderThan(tenantID string) time.Duration {
+	return time.Duration(o.getOverridesForTenant(tenantID).RejectOlderThan)
+}
 
 func (o *Overrides) DefaultLimits() *Limits {
 	return o.defaultLimits
@@ -290,7 +439,7 @@ func (sm *OverwriteMarshalingStringMap) Map() map[string]string {
 	return sm.m
 }
 
-// MarshalJSON explicitly uses the the type receiver and not pointer receiver
+// MarshalJSON explicitly uses the type receiver and not pointer receiver
 // or it won't be called
 func (sm OverwriteMarshalingStringMap) MarshalJSON() ([]byte, error) {
 	return json.Marshal(sm.m)
@@ -306,7 +455,7 @@ func (sm *OverwriteMarshalingStringMap) UnmarshalJSON(val []byte) error {
 	return nil
 }
 
-// MarshalYAML explicitly uses the the type receiver and not pointer receiver
+// MarshalYAML explicitly uses the type receiver and not pointer receiver
 // or it won't be called
 func (sm OverwriteMarshalingStringMap) MarshalYAML() (interface{}, error) {
 	return sm.m, nil

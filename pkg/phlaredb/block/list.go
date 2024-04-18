@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"time"
@@ -11,7 +12,6 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/thanos-io/objstore"
-	"github.com/thanos-io/thanos/pkg/block"
 	"golang.org/x/sync/errgroup"
 
 	phlareobj "github.com/grafana/pyroscope/pkg/objstore"
@@ -28,7 +28,11 @@ func ListBlocks(path string, ulidMinTime time.Time) (map[ulid.ULID]*Meta, error)
 		if !entry.IsDir() {
 			continue
 		}
-		meta, _, err := MetaFromDir(filepath.Join(path, entry.Name()))
+		path := filepath.Join(path, entry.Name())
+		if _, ok := IsBlockDir(path); !ok {
+			continue
+		}
+		meta, _, err := MetaFromDir(path)
 		if err != nil {
 			return nil, err
 		}
@@ -46,7 +50,6 @@ func ListBlocks(path string, ulidMinTime time.Time) (map[ulid.ULID]*Meta, error)
 // It returns the first error returned by the function.
 // It returns nil if all calls succeed.
 // The function is called concurrently.
-// Currently doesn't work with filesystem bucket.
 func IterBlockMetas(ctx context.Context, bkt phlareobj.Bucket, from, to time.Time, fn func(*Meta)) error {
 	allIDs, err := listAllBlockByPrefixes(ctx, bkt, from, to)
 	if err != nil {
@@ -60,8 +63,12 @@ func IterBlockMetas(ctx context.Context, bkt phlareobj.Bucket, from, to time.Tim
 		for _, id := range ids {
 			id := id
 			g.Go(func() error {
-				r, err := bkt.Get(ctx, id+block.MetaFilename)
+				r, err := bkt.Get(ctx, path.Join(id, MetaFilename))
 				if err != nil {
+					if bkt.IsObjNotFoundErr(err) {
+						level.Info(util.Logger).Log("msg", "skipping block as meta.json not found", "id", id)
+						return nil
+					}
 					return err
 				}
 
@@ -94,7 +101,7 @@ func listAllBlockByPrefixes(ctx context.Context, bkt phlareobj.Bucket, from, to 
 			level.Debug(util.Logger).Log("msg", "listing blocks", "prefix", prefix, "i", i)
 			prefixIds := []string{}
 			err := bkt.Iter(ctx, prefix, func(name string) error {
-				if _, ok := block.IsBlockDir(name); ok {
+				if _, ok := IsBlockDir(name); ok {
 					prefixIds = append(prefixIds, name)
 				}
 				return nil

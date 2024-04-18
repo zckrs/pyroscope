@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/dustin/go-humanize"
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/kv"
@@ -22,9 +22,18 @@ import (
 	"github.com/grafana/dskit/ring/client"
 	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/common/model"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	testhelper2 "github.com/grafana/pyroscope/pkg/pprof/testhelper"
+
+	profilev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
+	distributormodel "github.com/grafana/pyroscope/pkg/distributor/model"
 	phlaremodel "github.com/grafana/pyroscope/pkg/model"
+	pprof2 "github.com/grafana/pyroscope/pkg/pprof"
+	"github.com/grafana/pyroscope/pkg/util"
 
 	pushv1 "github.com/grafana/pyroscope/api/gen/proto/go/push/v1"
 	"github.com/grafana/pyroscope/api/gen/proto/go/push/v1/pushv1connect"
@@ -35,12 +44,20 @@ import (
 	"github.com/grafana/pyroscope/pkg/validation"
 )
 
-var ringConfig = RingConfig{
+var ringConfig = util.CommonRingConfig{
 	KVStore:      kv.Config{Store: "inmemory"},
 	InstanceID:   "foo",
 	InstancePort: 8080,
 	InstanceAddr: "127.0.0.1",
 	ListenPort:   8080,
+}
+
+type poolFactory struct {
+	f func(addr string) (client.PoolClient, error)
+}
+
+func (pf *poolFactory) FromInstance(inst ring.InstanceDesc) (client.PoolClient, error) {
+	return pf.f(inst.Addr)
 }
 
 func Test_ConnectPush(t *testing.T) {
@@ -50,9 +67,9 @@ func Test_ConnectPush(t *testing.T) {
 		DistributorRing: ringConfig,
 	}, testhelper.NewMockRing([]ring.InstanceDesc{
 		{Addr: "foo"},
-	}, 3), func(addr string) (client.PoolClient, error) {
+	}, 3), &poolFactory{func(addr string) (client.PoolClient, error) {
 		return ing, nil
-	}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
+	}}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
 
 	require.NoError(t, err)
 	mux.Handle(pushv1connect.NewPusherServiceHandler(d, connect.WithInterceptors(tenant.NewAuthInterceptor(true))))
@@ -71,7 +88,7 @@ func Test_ConnectPush(t *testing.T) {
 				},
 				Samples: []*pushv1.RawSample{
 					{
-						RawProfile: testProfile(t),
+						RawProfile: collectTestProfileBytes(t),
 					},
 				},
 			},
@@ -99,7 +116,7 @@ func Test_Replication(t *testing.T) {
 				},
 				Samples: []*pushv1.RawSample{
 					{
-						RawProfile: testProfile(t),
+						RawProfile: collectTestProfileBytes(t),
 					},
 				},
 			},
@@ -109,9 +126,9 @@ func Test_Replication(t *testing.T) {
 		{Addr: "1"},
 		{Addr: "2"},
 		{Addr: "3"},
-	}, 3), func(addr string) (client.PoolClient, error) {
+	}, 3), &poolFactory{f: func(addr string) (client.PoolClient, error) {
 		return ingesters[addr], nil
-	}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
+	}}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
 	require.NoError(t, err)
 	// only 1 ingester failing should be fine.
 	resp, err := d.Push(ctx, req)
@@ -131,9 +148,9 @@ func Test_Subservices(t *testing.T) {
 		DistributorRing: ringConfig,
 	}, testhelper.NewMockRing([]ring.InstanceDesc{
 		{Addr: "foo"},
-	}, 1), func(addr string) (client.PoolClient, error) {
+	}, 1), &poolFactory{f: func(addr string) (client.PoolClient, error) {
 		return ing, nil
-	}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
+	}}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
 
 	require.NoError(t, err)
 	require.NoError(t, d.StartAsync(context.Background()))
@@ -148,12 +165,24 @@ func Test_Subservices(t *testing.T) {
 	}, 5*time.Second, 100*time.Millisecond)
 }
 
-func testProfile(t *testing.T) []byte {
+func collectTestProfileBytes(t *testing.T) []byte {
 	t.Helper()
 
 	buf := bytes.NewBuffer(nil)
 	require.NoError(t, pprof.WriteHeapProfile(buf))
 	return buf.Bytes()
+}
+
+func hugeProfileBytes(t *testing.T) []byte {
+	t.Helper()
+	b := testhelper2.NewProfileBuilderWithLabels(time.Now().UnixNano(), nil)
+	p := b.CPUProfile()
+	for i := 0; i < 10_000; i++ {
+		p.ForStacktraceString(fmt.Sprintf("my_%d", i), "other").AddSamples(1)
+	}
+	bs, err := p.Profile.MarshalVT()
+	require.NoError(t, err)
+	return bs
 }
 
 type fakeIngester struct {
@@ -187,64 +216,452 @@ func TestBuckets(t *testing.T) {
 }
 
 func Test_Limits(t *testing.T) {
-	mux := http.NewServeMux()
-	ing := newFakeIngester(t, false)
-	d, err := New(Config{
-		DistributorRing: ringConfig,
-	}, testhelper.NewMockRing([]ring.InstanceDesc{
-		{Addr: "foo"},
-	}, 3), func(addr string) (client.PoolClient, error) {
-		return ing, nil
-	}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
+	type testCase struct {
+		description              string
+		pushReq                  *pushv1.PushRequest
+		overrides                *validation.Overrides
+		expectedCode             connect.Code
+		expectedValidationReason validation.Reason
+	}
 
-	require.NoError(t, err)
-	mux.Handle(pushv1connect.NewPusherServiceHandler(d, connect.WithInterceptors(tenant.NewAuthInterceptor(true))))
-	s := httptest.NewServer(mux)
-	defer s.Close()
-
-	client := pushv1connect.NewPusherServiceClient(http.DefaultClient, s.URL, connect.WithInterceptors(tenant.NewAuthInterceptor(true)))
-
-	t.Run("rate_limit", func(t *testing.T) {
-		resp, err := client.Push(tenant.InjectTenantID(context.Background(), "user-1"), connect.NewRequest(&pushv1.PushRequest{
-			Series: []*pushv1.RawProfileSeries{
-				{
-					Labels: []*typesv1.LabelPair{
-						{Name: "cluster", Value: "us-central1"},
-						{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
-						{Name: "__name__", Value: "cpu"},
-					},
-					Samples: []*pushv1.RawSample{
-						{
-							RawProfile: testProfile(t),
+	testCases := []testCase{
+		{
+			description: "rate_limit",
+			pushReq: &pushv1.PushRequest{
+				Series: []*pushv1.RawProfileSeries{
+					{
+						Labels: []*typesv1.LabelPair{
+							{Name: "cluster", Value: "us-central1"},
+							{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+							{Name: "__name__", Value: "cpu"},
+						},
+						Samples: []*pushv1.RawSample{
+							{
+								RawProfile: collectTestProfileBytes(t),
+							},
 						},
 					},
 				},
 			},
-		}))
-		require.Error(t, err)
-		require.Equal(t, connect.CodeResourceExhausted, connect.CodeOf(err))
-		require.Nil(t, resp)
-	})
-	t.Run("label limit", func(t *testing.T) {
-		resp, err := client.Push(tenant.InjectTenantID(context.Background(), "user-1"), connect.NewRequest(&pushv1.PushRequest{
-			Series: []*pushv1.RawProfileSeries{
-				{
-					Labels: []*typesv1.LabelPair{
-						{Name: "clusterdddwqdqdqdqdqdqw", Value: "us-central1"},
-						{Name: "__name__", Value: "cpu"},
+			overrides: validation.MockOverrides(func(defaults *validation.Limits, tenantLimits map[string]*validation.Limits) {
+				l := validation.MockDefaultLimits()
+				l.IngestionRateMB = 0.0150
+				l.IngestionBurstSizeMB = 0.0015
+				tenantLimits["user-1"] = l
+			}),
+			expectedCode:             connect.CodeResourceExhausted,
+			expectedValidationReason: validation.RateLimited,
+		},
+		{
+			description: "rate_limit_invalid_profile",
+			pushReq: &pushv1.PushRequest{
+				Series: []*pushv1.RawProfileSeries{
+					{
+						Labels: []*typesv1.LabelPair{
+							{Name: "__name__", Value: "cpu"},
+							{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+						},
+						Samples: []*pushv1.RawSample{{
+							RawProfile: hugeProfileBytes(t),
+						}},
 					},
-					Samples: []*pushv1.RawSample{
-						{
-							RawProfile: testProfile(t),
+				},
+			},
+			overrides: validation.MockOverrides(func(defaults *validation.Limits, tenantLimits map[string]*validation.Limits) {
+				l := validation.MockDefaultLimits()
+				l.IngestionBurstSizeMB = 0.0015
+				l.MaxProfileStacktraceSamples = 100
+				tenantLimits["user-1"] = l
+			}),
+			expectedCode:             connect.CodeResourceExhausted,
+			expectedValidationReason: validation.RateLimited,
+		},
+		{
+			description: "labels_limit",
+			pushReq: &pushv1.PushRequest{
+				Series: []*pushv1.RawProfileSeries{
+					{
+						Labels: []*typesv1.LabelPair{
+							{Name: "clusterdddwqdqdqdqdqdqw", Value: "us-central1"},
+							{Name: "__name__", Value: "cpu"},
+							{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+						},
+						Samples: []*pushv1.RawSample{
+							{
+								RawProfile: collectTestProfileBytes(t),
+							},
 						},
 					},
 				},
 			},
-		}))
-		require.Error(t, err)
-		require.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
-		require.Nil(t, resp)
-	})
+			overrides: validation.MockOverrides(func(defaults *validation.Limits, tenantLimits map[string]*validation.Limits) {
+				l := validation.MockDefaultLimits()
+				l.MaxLabelNameLength = 12
+				tenantLimits["user-1"] = l
+			}),
+			expectedCode:             connect.CodeInvalidArgument,
+			expectedValidationReason: validation.LabelNameTooLong,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.description, func(t *testing.T) {
+			mux := http.NewServeMux()
+			ing := newFakeIngester(t, false)
+			d, err := New(Config{
+				DistributorRing: ringConfig,
+			}, testhelper.NewMockRing([]ring.InstanceDesc{
+				{Addr: "foo"},
+			}, 3), &poolFactory{f: func(addr string) (client.PoolClient, error) {
+				return ing, nil
+			}}, tc.overrides, nil, log.NewLogfmtLogger(os.Stdout))
+
+			require.NoError(t, err)
+
+			expectedMetricDelta := map[prometheus.Collector]float64{
+				validation.DiscardedBytes.WithLabelValues(string(tc.expectedValidationReason), "user-1"): float64(uncompressedProfileSize(t, tc.pushReq)),
+				// todo make sure pyroscope_distributor_received_decompressed_bytes_sum is not incremented
+			}
+			m1 := metricsDump(expectedMetricDelta)
+
+			mux.Handle(pushv1connect.NewPusherServiceHandler(d, connect.WithInterceptors(tenant.NewAuthInterceptor(true))))
+			s := httptest.NewServer(mux)
+			defer s.Close()
+
+			client := pushv1connect.NewPusherServiceClient(http.DefaultClient, s.URL, connect.WithInterceptors(tenant.NewAuthInterceptor(true)))
+			resp, err := client.Push(tenant.InjectTenantID(context.Background(), "user-1"), connect.NewRequest(tc.pushReq))
+			require.Error(t, err)
+			require.Equal(t, tc.expectedCode, connect.CodeOf(err))
+			require.Nil(t, resp)
+			expectMetricsChange(t, m1, metricsDump(expectedMetricDelta), expectedMetricDelta)
+		})
+	}
+}
+
+func Test_Sessions_Limit(t *testing.T) {
+	type testCase struct {
+		description    string
+		seriesLabels   phlaremodel.Labels
+		expectedLabels phlaremodel.Labels
+		maxSessions    int
+	}
+
+	testCases := []testCase{
+		{
+			description: "session_disabled",
+			seriesLabels: []*typesv1.LabelPair{
+				{Name: "cluster", Value: "us-central1"},
+				{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+				{Name: phlaremodel.LabelNameSessionID, Value: phlaremodel.SessionID(1).String()},
+				{Name: "__name__", Value: "cpu"},
+			},
+			expectedLabels: []*typesv1.LabelPair{
+				{Name: "cluster", Value: "us-central1"},
+				{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+				{Name: "__name__", Value: "cpu"},
+			},
+			maxSessions: 0,
+		},
+		{
+			description: "session_limited",
+			seriesLabels: []*typesv1.LabelPair{
+				{Name: "cluster", Value: "us-central1"},
+				{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+				{Name: phlaremodel.LabelNameSessionID, Value: phlaremodel.SessionID(4).String()},
+				{Name: "__name__", Value: "cpu"},
+			},
+			expectedLabels: []*typesv1.LabelPair{
+				{Name: "cluster", Value: "us-central1"},
+				{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+				{Name: phlaremodel.LabelNameSessionID, Value: phlaremodel.SessionID(1).String()},
+				{Name: "__name__", Value: "cpu"},
+			},
+			maxSessions: 3,
+		},
+		{
+			description: "session_not_specified",
+			seriesLabels: []*typesv1.LabelPair{
+				{Name: "cluster", Value: "us-central1"},
+				{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+				{Name: "__name__", Value: "cpu"},
+			},
+			expectedLabels: []*typesv1.LabelPair{
+				{Name: "cluster", Value: "us-central1"},
+				{Name: phlaremodel.LabelNameServiceName, Value: "svc"},
+				{Name: "__name__", Value: "cpu"},
+			},
+			maxSessions: 3,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.description, func(t *testing.T) {
+			ing := newFakeIngester(t, false)
+			d, err := New(
+				Config{DistributorRing: ringConfig},
+				testhelper.NewMockRing([]ring.InstanceDesc{{Addr: "foo"}}, 3),
+				&poolFactory{f: func(addr string) (client.PoolClient, error) { return ing, nil }},
+				validation.MockOverrides(func(defaults *validation.Limits, tenantLimits map[string]*validation.Limits) {
+					l := validation.MockDefaultLimits()
+					l.MaxSessionsPerSeries = tc.maxSessions
+					tenantLimits["user-1"] = l
+				}), nil, log.NewLogfmtLogger(os.Stdout))
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedLabels, d.limitMaxSessionsPerSeries("user-1", tc.seriesLabels))
+		})
+	}
+}
+
+func Test_SampleLabels(t *testing.T) {
+	type testCase struct {
+		description string
+		pushReq     *distributormodel.PushRequest
+		series      []*distributormodel.ProfileSeries
+	}
+
+	testCases := []testCase{
+		{
+			description: "no series labels, no sample labels",
+			pushReq: &distributormodel.PushRequest{
+				Series: []*distributormodel.ProfileSeries{
+					{
+						Samples: []*distributormodel.ProfileSample{
+							{
+								Profile: pprof2.RawFromProto(&profilev1.Profile{
+									Sample: []*profilev1.Sample{{
+										Value: []int64{1},
+									}},
+								}),
+							},
+						},
+					},
+				},
+			},
+			series: []*distributormodel.ProfileSeries{
+				{
+					Samples: []*distributormodel.ProfileSample{
+						{
+							Profile: pprof2.RawFromProto(&profilev1.Profile{
+								Sample: []*profilev1.Sample{{
+									Value: []int64{1},
+								}},
+							}),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "has series labels, no sample labels",
+			pushReq: &distributormodel.PushRequest{
+				Series: []*distributormodel.ProfileSeries{
+					{
+						Labels: []*typesv1.LabelPair{
+							{Name: "foo", Value: "bar"},
+						},
+						Samples: []*distributormodel.ProfileSample{
+							{
+								Profile: pprof2.RawFromProto(&profilev1.Profile{
+									Sample: []*profilev1.Sample{{
+										Value: []int64{1},
+									}},
+								}),
+							},
+						},
+					},
+				},
+			},
+			series: []*distributormodel.ProfileSeries{
+				{
+					Labels: []*typesv1.LabelPair{
+						{Name: "foo", Value: "bar"},
+					},
+					Samples: []*distributormodel.ProfileSample{
+						{
+							Profile: pprof2.RawFromProto(&profilev1.Profile{
+								Sample: []*profilev1.Sample{{
+									Value: []int64{1},
+								}},
+							}),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "no series labels, all samples have identical label set",
+			pushReq: &distributormodel.PushRequest{
+				Series: []*distributormodel.ProfileSeries{
+					{
+						Samples: []*distributormodel.ProfileSample{
+							{
+								Profile: pprof2.RawFromProto(&profilev1.Profile{
+									StringTable: []string{"", "foo", "bar"},
+									Sample: []*profilev1.Sample{{
+										Value: []int64{1},
+										Label: []*profilev1.Label{
+											{Key: 1, Str: 2},
+										},
+									}},
+								}),
+							},
+						},
+					},
+				},
+			},
+			series: []*distributormodel.ProfileSeries{
+				{
+					Labels: []*typesv1.LabelPair{
+						{Name: "foo", Value: "bar"},
+					},
+					Samples: []*distributormodel.ProfileSample{
+						{
+							Profile: pprof2.RawFromProto(&profilev1.Profile{
+								StringTable: []string{"", "foo", "bar"},
+								Sample: []*profilev1.Sample{{
+									Value: []int64{1},
+									Label: []*profilev1.Label{},
+								}},
+							}),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "has series labels, all samples have identical label set",
+			pushReq: &distributormodel.PushRequest{
+				Series: []*distributormodel.ProfileSeries{
+					{
+						Labels: []*typesv1.LabelPair{
+							{Name: "baz", Value: "qux"},
+						},
+						Samples: []*distributormodel.ProfileSample{
+							{
+								Profile: pprof2.RawFromProto(&profilev1.Profile{
+									StringTable: []string{"", "foo", "bar"},
+									Sample: []*profilev1.Sample{{
+										Value: []int64{1},
+										Label: []*profilev1.Label{
+											{Key: 1, Str: 2},
+										},
+									}},
+								}),
+							},
+						},
+					},
+				},
+			},
+			series: []*distributormodel.ProfileSeries{
+				{
+					Labels: []*typesv1.LabelPair{
+						{Name: "baz", Value: "qux"},
+						{Name: "foo", Value: "bar"},
+					},
+					Samples: []*distributormodel.ProfileSample{
+						{
+							Profile: pprof2.RawFromProto(&profilev1.Profile{
+								StringTable: []string{"", "foo", "bar"},
+								Sample: []*profilev1.Sample{{
+									Value: []int64{1},
+									Label: []*profilev1.Label{},
+								}},
+							}),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "has series labels, samples have distinct label sets",
+			pushReq: &distributormodel.PushRequest{
+				Series: []*distributormodel.ProfileSeries{
+					{
+						Labels: []*typesv1.LabelPair{
+							{Name: "baz", Value: "qux"},
+						},
+						Samples: []*distributormodel.ProfileSample{
+							{
+								Profile: pprof2.RawFromProto(&profilev1.Profile{
+									StringTable: []string{"", "foo", "bar", "waldo", "fred"},
+									Sample: []*profilev1.Sample{
+										{
+											Value: []int64{1},
+											Label: []*profilev1.Label{
+												{Key: 1, Str: 2},
+											},
+										},
+										{
+											Value: []int64{2},
+											Label: []*profilev1.Label{
+												{Key: 3, Str: 4},
+											},
+										},
+									},
+								}),
+							},
+						},
+					},
+				},
+			},
+			series: []*distributormodel.ProfileSeries{
+				{
+					Labels: []*typesv1.LabelPair{
+						{Name: "baz", Value: "qux"},
+						{Name: "foo", Value: "bar"},
+					},
+					Samples: []*distributormodel.ProfileSample{
+						{
+							Profile: pprof2.RawFromProto(&profilev1.Profile{
+								StringTable: []string{""},
+								Sample: []*profilev1.Sample{{
+									Value: []int64{1},
+									Label: []*profilev1.Label{},
+								}},
+							}),
+						},
+					},
+				},
+				{
+					Labels: []*typesv1.LabelPair{
+						{Name: "baz", Value: "qux"},
+						{Name: "waldo", Value: "fred"},
+					},
+					Samples: []*distributormodel.ProfileSample{
+						{
+							Profile: pprof2.RawFromProto(&profilev1.Profile{
+								StringTable: []string{""},
+								Sample: []*profilev1.Sample{{
+									Value: []int64{2},
+									Label: []*profilev1.Label{},
+								}},
+							}),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.description, func(t *testing.T) {
+			series := extractSampleSeries(tc.pushReq)
+			require.Len(t, series, len(tc.series))
+			for i, actualSeries := range series {
+				expectedSeries := tc.series[i]
+				assert.Equal(t, expectedSeries.Labels, actualSeries.Labels)
+				require.Len(t, actualSeries.Samples, len(expectedSeries.Samples))
+				for j, actualProfile := range actualSeries.Samples {
+					expectedProfile := expectedSeries.Samples[j]
+					assert.Equal(t, expectedProfile.Profile.Sample, actualProfile.Profile.Sample)
+				}
+			}
+		})
+	}
 }
 
 func TestBadPushRequest(t *testing.T) {
@@ -254,9 +671,9 @@ func TestBadPushRequest(t *testing.T) {
 		DistributorRing: ringConfig,
 	}, testhelper.NewMockRing([]ring.InstanceDesc{
 		{Addr: "foo"},
-	}, 3), func(addr string) (client.PoolClient, error) {
+	}, 3), &poolFactory{f: func(addr string) (client.PoolClient, error) {
 		return ing, nil
-	}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
+	}}, newOverrides(t), nil, log.NewLogfmtLogger(os.Stdout))
 
 	require.NoError(t, err)
 	mux.Handle(pushv1connect.NewPusherServiceHandler(d, connect.WithInterceptors(tenant.NewAuthInterceptor(true))))
@@ -288,11 +705,6 @@ func newOverrides(t *testing.T) *validation.Overrides {
 		l.MaxLabelNameLength = 12
 		tenantLimits["user-1"] = l
 	})
-}
-
-// this is a valid but pretty empty cpu pprof
-func emptyCPUPprof() []byte {
-	return []byte{0x1f, 0x8b, 0x8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xff, 0xe2, 0x62, 0xe1, 0x60, 0x14, 0x60, 0xe2, 0x62, 0xe1, 0x60, 0x16, 0x60, 0xe1, 0x62, 0xe1, 0x60, 0x5, 0xb3, 0xd9, 0x4, 0x58, 0xa4, 0x4, 0x38, 0x18, 0x5, 0x1a, 0x1a, 0x1a, 0x98, 0x24, 0x1a, 0x1a, 0x76, 0xb, 0x69, 0xb0, 0x5b, 0x30, 0x1a, 0x31, 0x18, 0xf1, 0x26, 0xe6, 0xe4, 0xe4, 0x27, 0xc7, 0xe7, 0x27, 0x65, 0xa5, 0x26, 0x97, 0x14, 0x1b, 0xb1, 0x26, 0xe7, 0x97, 0xe6, 0x95, 0x18, 0x71, 0x43, 0x44, 0x8b, 0xb, 0x12, 0x93, 0x53, 0x8d, 0x58, 0x93, 0x2a, 0x4b, 0x52, 0x8b, 0x8d, 0x78, 0x33, 0xf3, 0x4a, 0x8b, 0x53, 0xe1, 0x2a, 0xb9, 0x21, 0x5c, 0x88, 0x12, 0x49, 0xfd, 0xd2, 0xe2, 0x22, 0xfd, 0x9c, 0xfc, 0xe4, 0xc4, 0x1c, 0xfd, 0xa4, 0xcc, 0x3c, 0xfd, 0x82, 0xa2, 0xfc, 0xdc, 0xd4, 0x92, 0x8c, 0xd4, 0xd2, 0x62, 0x23, 0x56, 0xb0, 0xa, 0x8f, 0x5f, 0x67, 0x3f, 0xfd, 0x9a, 0x73, 0xef, 0xfa, 0x4a, 0xf1, 0x80, 0x93, 0xad, 0x3d, 0x4f, 0x58, 0xa2, 0x58, 0x38, 0x38, 0x4, 0x58, 0x12, 0x1a, 0x1a, 0x14, 0x0, 0x1, 0x0, 0x0, 0xff, 0xff, 0x55, 0xb6, 0xc2, 0xa9, 0xae, 0x0, 0x0, 0x0}
 }
 
 func TestPush_ShuffleSharding(t *testing.T) {
@@ -335,9 +747,9 @@ func TestPush_ShuffleSharding(t *testing.T) {
 
 	// get distributor ready
 	d, err := New(Config{DistributorRing: ringConfig}, testhelper.NewMockRing(ringDesc, 3),
-		func(addr string) (client.PoolClient, error) {
+		&poolFactory{func(addr string) (client.PoolClient, error) {
 			return ingesters[addr], nil
-		},
+		}},
 		overrides,
 		nil,
 		log.NewLogfmtLogger(os.Stdout),
@@ -350,6 +762,17 @@ func TestPush_ShuffleSharding(t *testing.T) {
 	defer s.Close()
 
 	client := pushv1connect.NewPusherServiceClient(http.DefaultClient, s.URL, connect.WithInterceptors(tenant.NewAuthInterceptor(true)))
+
+	// Empty profiles are discarded before sending to ingesters.
+	var buf bytes.Buffer
+	_, err = pprof2.RawFromProto(&profilev1.Profile{
+		Sample: []*profilev1.Sample{{
+			LocationId: []uint64{1},
+			Value:      []int64{1},
+		}},
+	}).WriteTo(&buf)
+	require.NoError(t, err)
+	profileBytes := buf.Bytes()
 
 	for i := 0; i < 10; i++ {
 		tenantID := fmt.Sprintf("user-%d", i)
@@ -367,7 +790,7 @@ func TestPush_ShuffleSharding(t *testing.T) {
 							{Name: "__name__", Value: "cpu"},
 						},
 						Samples: []*pushv1.RawSample{
-							{ID: "0000000-0000-0000-0000-000000000001", RawProfile: emptyCPUPprof()},
+							{ID: "0000000-0000-0000-0000-000000000001", RawProfile: profileBytes},
 						},
 					},
 				},
@@ -413,5 +836,281 @@ func TestPush_ShuffleSharding(t *testing.T) {
 			}
 			require.Equal(t, 150, series)
 		}
+	}
+}
+
+func TestPush_Aggregation(t *testing.T) {
+	const maxSessions = 8
+	ingesterClient := newFakeIngester(t, false)
+	d, err := New(
+		Config{DistributorRing: ringConfig, PushTimeout: time.Second * 10},
+		testhelper.NewMockRing([]ring.InstanceDesc{{Addr: "foo"}}, 3),
+		&poolFactory{f: func(addr string) (client.PoolClient, error) { return ingesterClient, nil }},
+		validation.MockOverrides(func(defaults *validation.Limits, tenantLimits map[string]*validation.Limits) {
+			l := validation.MockDefaultLimits()
+			l.DistributorAggregationPeriod = model.Duration(time.Second)
+			l.DistributorAggregationWindow = model.Duration(time.Second)
+			l.MaxSessionsPerSeries = maxSessions
+			tenantLimits["user-1"] = l
+		}),
+		nil, log.NewLogfmtLogger(os.Stdout),
+	)
+	require.NoError(t, err)
+	ctx := tenant.InjectTenantID(context.Background(), "user-1")
+
+	const (
+		clients  = 10
+		requests = 10
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(clients)
+	for i := 0; i < clients; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			for j := 0; j < requests; j++ {
+				_, err := d.PushParsed(ctx, &distributormodel.PushRequest{
+					Series: []*distributormodel.ProfileSeries{
+						{
+							Labels: []*typesv1.LabelPair{
+								{Name: "cluster", Value: "us-central1"},
+								{Name: "client", Value: strconv.Itoa(i)},
+								{Name: "__name__", Value: "cpu"},
+								{
+									Name:  phlaremodel.LabelNameSessionID,
+									Value: phlaremodel.SessionID(i*j + i).String(),
+								},
+							},
+							Samples: []*distributormodel.ProfileSample{
+								{
+									Profile: &pprof2.Profile{
+										Profile: testProfile(0),
+									},
+								},
+							},
+						},
+					},
+				})
+				require.NoError(t, err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	d.asyncRequests.Wait()
+
+	var sum int64
+	sessions := make(map[string]struct{})
+	assert.GreaterOrEqual(t, len(ingesterClient.requests), 20)
+	assert.Less(t, len(ingesterClient.requests), 100)
+	for _, r := range ingesterClient.requests {
+		for _, s := range r.Series {
+			sessionID := phlaremodel.Labels(s.Labels).Get(phlaremodel.LabelNameSessionID)
+			sessions[sessionID] = struct{}{}
+			p, err := pprof2.RawFromBytes(s.Samples[0].RawProfile)
+			require.NoError(t, err)
+			for _, x := range p.Sample {
+				sum += x.Value[0]
+			}
+		}
+	}
+
+	// RF * samples_per_profile * clients * requests
+	assert.Equal(t, int64(3*2*clients*requests), sum)
+	assert.Equal(t, len(sessions), maxSessions)
+}
+
+func testProfile(t int64) *profilev1.Profile {
+	return &profilev1.Profile{
+		SampleType: []*profilev1.ValueType{
+			{
+				Type: 1,
+				Unit: 2,
+			},
+			{
+				Type: 3,
+				Unit: 4,
+			},
+		},
+		Sample: []*profilev1.Sample{
+			{
+				LocationId: []uint64{1, 2},
+				Value:      []int64{1, 10000000},
+				Label: []*profilev1.Label{
+					{Key: 5, Str: 6},
+				},
+			},
+			{
+				LocationId: []uint64{1, 2, 3},
+				Value:      []int64{1, 10000000},
+				Label: []*profilev1.Label{
+					{Key: 5, Str: 6},
+					{Key: 7, Str: 8},
+				},
+			},
+		},
+		Mapping: []*profilev1.Mapping{
+			{
+				Id:           1,
+				HasFunctions: true,
+			},
+		},
+		Location: []*profilev1.Location{
+			{
+				Id:        1,
+				MappingId: 1,
+				Line:      []*profilev1.Line{{FunctionId: 1}},
+			},
+			{
+				Id:        2,
+				MappingId: 1,
+				Line:      []*profilev1.Line{{FunctionId: 2}},
+			},
+			{
+				Id:        3,
+				MappingId: 1,
+				Line:      []*profilev1.Line{{FunctionId: 3}},
+			},
+		},
+		Function: []*profilev1.Function{
+			{
+				Id:         1,
+				Name:       9,
+				SystemName: 9,
+				Filename:   10,
+			},
+			{
+				Id:         2,
+				Name:       11,
+				SystemName: 11,
+				Filename:   12,
+			},
+			{
+				Id:         3,
+				Name:       13,
+				SystemName: 13,
+				Filename:   14,
+			},
+		},
+		StringTable: []string{
+			"",
+			"samples",
+			"count",
+			"cpu",
+			"nanoseconds",
+			// Labels
+			"foo",
+			"bar",
+			"function",
+			"slow",
+			// Functions
+			"func-foo",
+			"func-foo-path",
+			"func-bar",
+			"func-bar-path",
+			"func-baz",
+			"func-baz-path",
+		},
+		TimeNanos:     t,
+		DurationNanos: 10000000000,
+		PeriodType: &profilev1.ValueType{
+			Type: 3,
+			Unit: 4,
+		},
+		Period: 10000000,
+	}
+}
+
+func TestInjectMappingVersions(t *testing.T) {
+	alreadyVersionned := testProfile(3)
+	alreadyVersionned.StringTable = append(alreadyVersionned.StringTable, `foo`)
+	alreadyVersionned.Mapping[0].BuildId = int64(len(alreadyVersionned.StringTable) - 1)
+	in := []*distributormodel.ProfileSeries{
+		{
+			Labels: []*typesv1.LabelPair{},
+			Samples: []*distributormodel.ProfileSample{
+				{
+					Profile: &pprof2.Profile{
+						Profile: testProfile(1),
+					},
+				},
+			},
+		},
+		{
+			Labels: []*typesv1.LabelPair{
+				{Name: phlaremodel.LabelNameServiceRepository, Value: "grafana/pyroscope"},
+			},
+			Samples: []*distributormodel.ProfileSample{
+				{
+					Profile: &pprof2.Profile{
+						Profile: testProfile(2),
+					},
+				},
+			},
+		},
+		{
+			Labels: []*typesv1.LabelPair{
+				{Name: phlaremodel.LabelNameServiceRepository, Value: "grafana/pyroscope"},
+				{Name: phlaremodel.LabelNameServiceGitRef, Value: "foobar"},
+			},
+			Samples: []*distributormodel.ProfileSample{
+				{
+					Profile: &pprof2.Profile{
+						Profile: testProfile(2),
+					},
+				},
+			},
+		},
+		{
+			Labels: []*typesv1.LabelPair{
+				{Name: phlaremodel.LabelNameServiceRepository, Value: "grafana/pyroscope"},
+				{Name: phlaremodel.LabelNameServiceGitRef, Value: "foobar"},
+			},
+			Samples: []*distributormodel.ProfileSample{
+				{
+					Profile: &pprof2.Profile{
+						Profile: alreadyVersionned,
+					},
+				},
+			},
+		},
+	}
+
+	err := injectMappingVersions(in)
+	require.NoError(t, err)
+	require.Equal(t, "", in[0].Samples[0].Profile.StringTable[in[0].Samples[0].Profile.Mapping[0].BuildId])
+	require.Equal(t, `{"repository":"grafana/pyroscope"}`, in[1].Samples[0].Profile.StringTable[in[1].Samples[0].Profile.Mapping[0].BuildId])
+	require.Equal(t, `{"repository":"grafana/pyroscope","git_ref":"foobar"}`, in[2].Samples[0].Profile.StringTable[in[2].Samples[0].Profile.Mapping[0].BuildId])
+	require.Equal(t, `{"repository":"grafana/pyroscope","git_ref":"foobar","build_id":"foo"}`, in[3].Samples[0].Profile.StringTable[in[3].Samples[0].Profile.Mapping[0].BuildId])
+}
+
+func uncompressedProfileSize(t *testing.T, req *pushv1.PushRequest) int {
+	var size int
+	for _, s := range req.Series {
+		for _, label := range s.Labels {
+			size += len(label.Name) + len(label.Value)
+		}
+		for _, sample := range s.Samples {
+			p, err := pprof2.RawFromBytes(sample.RawProfile)
+			require.NoError(t, err)
+			size += p.SizeVT()
+		}
+	}
+	return size
+}
+
+func metricsDump(metrics map[prometheus.Collector]float64) map[prometheus.Collector]float64 {
+	res := make(map[prometheus.Collector]float64)
+	for m := range metrics {
+		res[m] = testutil.ToFloat64(m)
+	}
+	return res
+}
+
+func expectMetricsChange(t *testing.T, m1, m2, expectedChange map[prometheus.Collector]float64) {
+	for counter, expectedDelta := range expectedChange {
+		delta := m2[counter] - m1[counter]
+		assert.Equal(t, expectedDelta, delta, "metric %s", counter)
 	}
 }

@@ -5,9 +5,9 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/grafana/dskit/tenant"
-	"github.com/weaveworks/common/user"
+	"github.com/grafana/dskit/user"
 )
 
 // DefaultTenantID is the default tenant ID used when the interceptor is disabled.
@@ -83,7 +83,7 @@ func (i *authInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc
 	}
 }
 
-var defaultResolver tenant.Resolver = tenant.NewSingleResolver()
+var defaultResolver tenant.Resolver = tenant.NewMultiResolver()
 
 // ExtractTenantIDFromHeaders extracts a single TenantID from http headers.
 func ExtractTenantIDFromHeaders(ctx context.Context, headers http.Header) (string, context.Context, error) {

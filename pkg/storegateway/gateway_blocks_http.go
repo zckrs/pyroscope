@@ -13,10 +13,10 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
-	"github.com/grafana/mimir/pkg/storage/tsdb"
-	"github.com/grafana/mimir/pkg/util"
+	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/grafana/pyroscope/pkg/phlaredb/block"
+	"github.com/grafana/pyroscope/pkg/util"
 )
 
 //go:embed blocks.gohtml
@@ -100,11 +100,11 @@ func (s *StoreGateway) BlocksHandler(w http.ResponseWriter, req *http.Request) {
 		}
 		var sources []string
 		for _, pb := range m.Compaction.Sources {
-			sources = append(parents, pb.String())
+			sources = append(sources, pb.String())
 		}
 		var blockSplitID *uint32
 		if splitCount > 0 {
-			bsc := tsdb.HashBlockID(m.ULID) % uint32(splitCount)
+			bsc := block.HashBlockID(m.ULID) % uint32(splitCount)
 			blockSplitID = &bsc
 		}
 
@@ -125,6 +125,7 @@ func (s *StoreGateway) BlocksHandler(w http.ResponseWriter, req *http.Request) {
 			Stats:           m.Stats,
 			Sources:         sources,
 			Parents:         parents,
+			Labels:          labels.FromMap(m.Labels).String(),
 		})
 
 		richMetas = append(richMetas, richMeta{

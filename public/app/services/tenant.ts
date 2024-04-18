@@ -1,8 +1,7 @@
-import { RequestNotOkError, requestWithOrgID } from '@webapp/services/base';
-import store from '@webapp/redux/store';
+import { RequestNotOkError, request } from '@pyroscope/services/base';
 
 export async function isMultiTenancyEnabled() {
-  const res = await requestWithOrgID('/querier.v1.QuerierService/LabelNames', {
+  const res = await request('/querier.v1.QuerierService/LabelNames', {
     // Without this it would automatically add the OrgID
     // Which doesn't tell us whether multitenancy is enabled or not
     headers: {
@@ -23,7 +22,7 @@ export async function isMultiTenancyEnabled() {
   return isOrgRequiredError(res);
 }
 
-function isOrgRequiredError(res: Awaited<ReturnType<typeof requestWithOrgID>>) {
+function isOrgRequiredError(res: Awaited<ReturnType<typeof request>>) {
   // TODO: is 'no org id' a stable message?
   return (
     res.isErr &&
@@ -31,8 +30,4 @@ function isOrgRequiredError(res: Awaited<ReturnType<typeof requestWithOrgID>>) {
     res.error.code === 401 &&
     res.error.description.includes('no org id')
   );
-}
-
-export function tenantIDFromStorage(): string {
-  return store.getState().tenant.tenantID || '';
 }

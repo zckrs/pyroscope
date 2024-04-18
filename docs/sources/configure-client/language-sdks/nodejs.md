@@ -1,15 +1,26 @@
 ---
-title: "NodeJS"
-menuTitle: "NodeJS"
-description: "Instrumenting nodeJS applications for continuous profiling"
-weight: 30
+title: "Node.js"
+menuTitle: "Node.js"
+description: "Instrumenting Node.js applications for continuous profiling."
+weight: 80
+aliases:
+  - /docs/phlare/latest/configure-client/language-sdks/nodejs
 ---
 
-# NodeJS
+# Node.js
 
-## How to add NodeJS profiling to your application
+Enhance your Node.js application's performance with our Node.js Profiler. Seamlessly integrated with Pyroscope, it provides real-time insights into your application’s operation, helping you identify and resolve performance bottlenecks. This integration is key for Node.js developers aiming to boost efficiency, reduce latency, and maintain optimal application performance.
 
-To start profiling a NodeJS application, you need to include the npm module in your app:
+## Before you begin
+
+To capture and analyze profiling data, you need either a hosted Pyroscope OSS server or a hosted [Pyroscope instance with Grafana Cloud Profiles](/products/cloud/profiles-for-continuous-profiling/) (requires a free Grafana Cloud account).
+
+The Pyroscope server can be a local server for development or a remote server for production use.
+
+## Add Node.js profiling to your application
+
+To start profiling a Node.js application, you need to include the npm module in your app:
+
 ```
 npm install @pyroscope/nodejs
 
@@ -17,7 +28,9 @@ npm install @pyroscope/nodejs
 yarn add @pyroscope/nodejs
 ```
 
-Then add the following code to your application:
+## Configure the Node.js client
+
+Add the following code to your application:
 
 ```javascript
 const Pyroscope = require('@pyroscope/nodejs');
@@ -30,9 +43,11 @@ Pyroscope.init({
 Pyroscope.start()
 ```
 
-## How to add profiling labels to NodeJS applications
+Note: If you'd prefer to use Pull mode you can do so using the [Grafana Agent]({{< relref "../grafana-agent" >}}).
 
-It is possible to add tags (labels) to the profiling data. These tags can be used to filter the data in the UI. Dynamic tagging isn't supported yet
+### Add profiling labels to Node.js applications
+
+It is possible to add tags (labels) to the profiling data. These tags can be used to filter the data in the UI. Dynamic tagging isn't supported yet.
 
 ```javascript
 Pyroscope.init({
@@ -41,65 +56,39 @@ Pyroscope.init({
   tags: {
     region: ENV['region']
   },
-  // authToken: ENV['PYROSCOPE_AUTH_TOKEN'],
-  // basicAuthUser: ENV['PYROSCOPE_BASIC_AUTH_USER'],
-  // basicAuthPassword: ENV['PYROSCOPE_BASIC_AUTH_PASSWORD'],
+});
+
+Pyroscope.start()
+```
+
+## Send data to Pyroscope OSS or Grafana Cloud
+
+```javascript
+Pyroscope.init({
+  serverAddress: 'http://pyroscope:4040',
+  appName: 'myNodeService',
+  tags: {
+    region: ENV['region']
+  },
+  basicAuthUser: ENV['PYROSCOPE_BASIC_AUTH_USER'],
+  basicAuthPassword: ENV['PYROSCOPE_BASIC_AUTH_PASSWORD'],
+  // Optional Pyroscope tenant ID (only needed if using multi-tenancy). Not needed for Grafana Cloud.
   // tenantID: ENV['PYROSCOPE_TENANT_ID'],
 });
 
 Pyroscope.start()
 ```
 
-## Pull Mode profiling for NodeJS
-
-NodeJS integration also supports pull mode. For that to work you will need to make sure you have profiling routes (`/debug/pprof/profile` and `/debug/pprof/heap`) enabled in your http server. For that you may use our `expressMiddleware` or create endpoints yourself
-```javascript
-const Pyroscope, { expressMiddleware } = require('@pyroscope/nodejs');
-
-Pyroscope.init({...})
-
-app.use(expressMiddleware())
-```
-
-Note: For __pull mode__, you don't need to `.start()` but you'll need to `.init()` 
-
-### Scrape configuration
-
-You will need to add the following content to your `pyroscope/server.yml` Pyroscope config file. See the [Server config documentation](/docs/server-configuration#configuration-file) for more information on where this config is located by default on your system.
-
-```yaml
----
-# A list of scrape configurations.
-scrape-configs:
-  # The job name assigned to scraped profiles by default.
-  - job-name: pyroscope
-
-    # The list of profiles to be scraped from the targets.
-    enabled-profiles: [cpu, mem]
-
-    # List of labeled statically configured targets for this job.
-    static-configs:
-      - application: my-nodejsapp-name
-        spy-name: nodespy 
-        targets:
-          - hostname:6060
-        labels:
-          env: dev
-```
-
-## Sending data to Grafana Cloud or Phlare with Pyroscope NodeJS SDK
-
-To configure NodeJS sdk to send data to Phlare, replace the `serverAddress` placeholder with the appropriate server URL. This could be the Grafana Cloud Pyroscope URL or your own custom Phlare server URL.
+To configure the Node.js SDK to send data to Pyroscope, replace the `serverAddress` placeholder with the appropriate server URL. This could be the Grafana Cloud Pyroscope URL or your own custom Pyroscope server URL.
 
 If you need to send data to Grafana Cloud, you’ll have to configure HTTP Basic authentication. Replace `basicAuthUser` with your Grafana Cloud stack user ID and `basicAuthPassword` with your Grafana Cloud API key.
 
-If your Phlare server has multi-tenancy enabled, you’ll need to configure a tenant ID. Replace `tenantID` with your Phlare tenant ID.
+If your Pyroscope server has multi-tenancy enabled, you’ll need to configure a tenant ID. Replace `tenantID` with your Pyroscope tenant ID.
 
-## Troubleshooting
+## Troubleshoot
 
-You may set `DEBUG` env to `pyroscope` and see debugging information which can help you understand if everything is OK.
+Setting `DEBUG` env to `pyroscope` provides additional debugging information.
 
 ```bash
 DEBUG=pyroscope node index.js
 ```
-

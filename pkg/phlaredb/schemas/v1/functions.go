@@ -1,7 +1,7 @@
 package v1
 
 import (
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 
 	profilev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
 )
@@ -52,4 +52,9 @@ type InMemoryFunction struct {
 	Filename uint32
 	// Line number in source file.
 	StartLine uint32
+}
+
+func (f *InMemoryFunction) Clone() *InMemoryFunction {
+	n := *f
+	return &n
 }

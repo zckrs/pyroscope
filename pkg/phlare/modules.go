@@ -3,42 +3,49 @@ package phlare
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/dns"
 	"github.com/grafana/dskit/kv/codec"
 	"github.com/grafana/dskit/kv/memberlist"
+	"github.com/grafana/dskit/middleware"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/runtimeconfig"
+	"github.com/grafana/dskit/server"
 	"github.com/grafana/dskit/services"
 	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/common/version"
-	"github.com/thanos-io/thanos/pkg/discovery/dns"
-	"github.com/weaveworks/common/middleware"
-	"github.com/weaveworks/common/server"
+	"github.com/prometheus/client_golang/prometheus/collectors/version"
+	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"google.golang.org/genproto/googleapis/api/httpbody"
 	"google.golang.org/protobuf/encoding/protojson"
 	"gopkg.in/yaml.v3"
 
-	"github.com/grafana/pyroscope/api/gen/proto/go/push/v1/pushv1connect"
 	statusv1 "github.com/grafana/pyroscope/api/gen/proto/go/status/v1"
-	"github.com/grafana/pyroscope/pkg/agent"
+	"github.com/grafana/pyroscope/pkg/adhocprofiles"
+	apiversion "github.com/grafana/pyroscope/pkg/api/version"
+	"github.com/grafana/pyroscope/pkg/compactor"
 	"github.com/grafana/pyroscope/pkg/distributor"
 	"github.com/grafana/pyroscope/pkg/frontend"
 	"github.com/grafana/pyroscope/pkg/ingester"
 	objstoreclient "github.com/grafana/pyroscope/pkg/objstore/client"
 	"github.com/grafana/pyroscope/pkg/objstore/providers/filesystem"
+	"github.com/grafana/pyroscope/pkg/operations"
 	phlarecontext "github.com/grafana/pyroscope/pkg/phlare/context"
 	"github.com/grafana/pyroscope/pkg/querier"
 	"github.com/grafana/pyroscope/pkg/querier/worker"
 	"github.com/grafana/pyroscope/pkg/scheduler"
+	"github.com/grafana/pyroscope/pkg/settings"
 	"github.com/grafana/pyroscope/pkg/storegateway"
 	"github.com/grafana/pyroscope/pkg/usagestats"
 	"github.com/grafana/pyroscope/pkg/util"
@@ -47,11 +54,11 @@ import (
 	"github.com/grafana/pyroscope/pkg/validation/exporter"
 )
 
-// The various modules that make up Phlare.
+// The various modules that make up Pyroscope.
 const (
 	All               string = "all"
-	Agent             string = "agent"
 	API               string = "api"
+	Version           string = "version"
 	Distributor       string = "distributor"
 	Server            string = "server"
 	Ring              string = "ring"
@@ -67,9 +74,12 @@ const (
 	RuntimeConfig     string = "runtime-config"
 	Overrides         string = "overrides"
 	OverridesExporter string = "overrides-exporter"
+	Compactor         string = "compactor"
+	Admin             string = "admin"
+	TenantSettings    string = "tenant-settings"
+	AdHocProfiles     string = "ad-hoc-profiles"
 
 	// QueryFrontendTripperware string = "query-frontend-tripperware"
-	// Compactor                string = "compactor"
 	// IndexGateway             string = "index-gateway"
 	// IndexGatewayRing         string = "index-gateway-ring"
 )
@@ -95,7 +105,7 @@ func (f *Phlare) initQueryFrontend() (services.Service, error) {
 		return nil, err
 	}
 
-	f.API.RegisterPyroscopeHandlers(querier.NewGRPCRoundTripper(frontendSvc))
+	f.API.RegisterPyroscopeHandlers(frontendSvc)
 	f.API.RegisterQueryFrontend(frontendSvc)
 	f.API.RegisterQuerier(frontendSvc)
 
@@ -113,7 +123,7 @@ func (f *Phlare) initRuntimeConfig() (services.Service, error) {
 	// make sure to set default limits before we start loading configuration into memory
 	validation.SetDefaultLimitsForYAMLUnmarshalling(f.Cfg.LimitsConfig)
 
-	serv, err := runtimeconfig.New(f.Cfg.RuntimeConfig, prometheus.WrapRegistererWithPrefix("pyroscope_", f.reg), log.With(f.logger, "component", "runtime-config"))
+	serv, err := runtimeconfig.New(f.Cfg.RuntimeConfig, "pyroscope", prometheus.WrapRegistererWithPrefix("pyroscope_", f.reg), log.With(f.logger, "component", "runtime-config"))
 	if err == nil {
 		// TenantLimits just delegates to RuntimeConfig and doesn't have any state or need to do
 		// anything in the start/stopping phase. Thus we can create it as part of runtime config
@@ -125,6 +135,41 @@ func (f *Phlare) initRuntimeConfig() (services.Service, error) {
 	f.API.RegisterRuntimeConfig(runtimeConfigHandler(f.RuntimeConfig, f.Cfg.LimitsConfig), validation.TenantLimitsHandler(f.Cfg.LimitsConfig, f.TenantLimits))
 
 	return serv, err
+}
+
+func (f *Phlare) initTenantSettings() (services.Service, error) {
+	var store settings.Store
+	var err error
+
+	switch {
+	case f.storageBucket != nil:
+		store, err = settings.NewBucketStore(f.storageBucket)
+	default:
+		store, err = settings.NewMemoryStore()
+		level.Warn(f.logger).Log("msg", "using in-memory settings store, changes will be lost after shutdown")
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to init settings store")
+	}
+
+	settings, err := settings.New(store, log.With(f.logger, "component", TenantSettings))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to init settings service")
+	}
+
+	f.API.RegisterTenantSettings(settings)
+	return settings, nil
+}
+
+func (f *Phlare) initAdHocProfiles() (services.Service, error) {
+	if f.storageBucket == nil {
+		level.Warn(f.logger).Log("msg", "no storage bucket configured, ad hoc profiles will not be loaded")
+		return nil, nil
+	}
+
+	a := adhocprofiles.NewAdHocProfiles(f.storageBucket, f.logger, f.Overrides)
+	f.API.RegisterAdHocProfiles(a)
+	return a, nil
 }
 
 func (f *Phlare) initOverrides() (serv services.Service, err error) {
@@ -167,6 +212,23 @@ func (f *Phlare) initQueryScheduler() (services.Service, error) {
 	return s, nil
 }
 
+func (f *Phlare) initCompactor() (serv services.Service, err error) {
+	f.Cfg.Compactor.ShardingRing.Common.ListenPort = f.Cfg.Server.HTTPListenPort
+
+	if f.storageBucket == nil {
+		return nil, nil
+	}
+
+	f.Compactor, err = compactor.NewMultitenantCompactor(f.Cfg.Compactor, f.storageBucket, f.Overrides, log.With(f.logger, "component", "compactor"), f.reg)
+	if err != nil {
+		return
+	}
+
+	// Expose HTTP endpoints.
+	f.API.RegisterCompactor(f.Compactor)
+	return f.Compactor, nil
+}
+
 // setupWorkerTimeout sets the max loop duration for the querier worker and frontend worker
 // to 90% of the read or write http timeout, whichever is smaller.
 // This is to ensure that the worker doesn't timeout before the http handler and that the connection
@@ -184,32 +246,32 @@ func (f *Phlare) setupWorkerTimeout() {
 }
 
 func (f *Phlare) initQuerier() (services.Service, error) {
-	var (
-		storeGatewayQuerier *querier.StoreGatewayQuerier
-		err                 error
-	)
-	// In microservices mode the store gateway is mandatory.
-	if f.Cfg.Target.String() != All {
-		storeGatewayQuerier, err = querier.NewStoreGatewayQuerier(f.Cfg.StoreGateway.Config, nil, f.Overrides, log.With(f.logger, "component", "store-gateway-querier"), f.reg, f.auth)
-		if err != nil {
-			return nil, err
-		}
+	newQuerierParams := &querier.NewQuerierParams{
+		Cfg:             f.Cfg.Querier,
+		StoreGatewayCfg: f.Cfg.StoreGateway,
+		Overrides:       f.Overrides,
+		CfgProvider:     f.Overrides,
+		StorageBucket:   f.storageBucket,
+		IngestersRing:   f.ring,
+		Reg:             f.reg,
+		Logger:          log.With(f.logger, "component", "querier"),
+		ClientOptions:   []connect.ClientOption{f.auth},
 	}
-
-	querierSvc, err := querier.New(f.Cfg.Querier, f.ring, nil, storeGatewayQuerier, f.reg, log.With(f.logger, "component", "querier"), f.auth)
+	querierSvc, err := querier.New(newQuerierParams)
 	if err != nil {
 		return nil, err
 	}
+
 	if !f.isModuleActive(QueryFrontend) {
 		f.API.RegisterPyroscopeHandlers(querierSvc)
 		f.API.RegisterQuerier(querierSvc)
 	}
-	worker, err := worker.NewQuerierWorker(f.Cfg.Worker, querier.NewGRPCHandler(querierSvc), log.With(f.logger, "component", "querier-worker"), f.reg)
+	qWorker, err := worker.NewQuerierWorker(f.Cfg.Worker, querier.NewGRPCHandler(querierSvc), log.With(f.logger, "component", "querier-worker"), f.reg)
 	if err != nil {
 		return nil, err
 	}
 
-	sm, err := services.NewManager(querierSvc, worker)
+	sm, err := services.NewManager(querierSvc, qWorker)
 	if err != nil {
 		return nil, err
 	}
@@ -235,10 +297,6 @@ func (f *Phlare) initQuerier() (services.Service, error) {
 	}), nil
 }
 
-func (f *Phlare) getPusherClient() pushv1connect.PusherServiceClient {
-	return f.pusherClient
-}
-
 func (f *Phlare) initGRPCGateway() (services.Service, error) {
 	f.grpcGatewayMux = grpcgw.NewServeMux(
 		grpcgw.WithMarshalerOption("application/json+pretty", &grpcgw.JSONPb{
@@ -261,31 +319,15 @@ func (f *Phlare) initDistributor() (services.Service, error) {
 		return nil, err
 	}
 
-	// initialise direct pusher, this overwrites the default HTTP client
-	f.pusherClient = d
-
 	f.API.RegisterDistributor(d)
 	return d, nil
-}
-
-func (f *Phlare) initAgent() (services.Service, error) {
-	a, err := agent.New(&f.Cfg.AgentConfig, log.With(f.logger, "component", "agent"), f.getPusherClient)
-	if err != nil {
-		return nil, err
-	}
-	f.agent = a
-
-	if err := f.API.RegisterAgent(a); err != nil {
-		return nil, err
-	}
-
-	return a, nil
 }
 
 func (f *Phlare) initMemberlistKV() (services.Service, error) {
 	f.Cfg.MemberlistKV.Codecs = []codec.Codec{
 		ring.GetCodec(),
 		usagestats.JSONCodec,
+		apiversion.GetCodec(),
 	}
 
 	dnsProviderReg := prometheus.WrapRegistererWithPrefix(
@@ -302,9 +344,9 @@ func (f *Phlare) initMemberlistKV() (services.Service, error) {
 	f.Cfg.Distributor.DistributorRing.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
 	f.Cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
 	f.Cfg.QueryScheduler.ServiceDiscovery.SchedulerRing.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
-	f.Cfg.OverridesExporter.Ring.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
-	f.Cfg.StoreGateway.ShardingRing.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
-
+	f.Cfg.OverridesExporter.Ring.Ring.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
+	f.Cfg.StoreGateway.ShardingRing.Ring.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
+	f.Cfg.Compactor.ShardingRing.Common.KVStore.MemberlistKV = f.MemberlistKV.GetMemberlistKV
 	f.Cfg.Frontend.QuerySchedulerDiscovery = f.Cfg.QueryScheduler.ServiceDiscovery
 	f.Cfg.Worker.QuerySchedulerDiscovery = f.Cfg.QueryScheduler.ServiceDiscovery
 
@@ -326,7 +368,10 @@ func (f *Phlare) initRing() (_ services.Service, err error) {
 
 func (f *Phlare) initStorage() (_ services.Service, err error) {
 	objectStoreTypeStats.Set(f.Cfg.Storage.Bucket.Backend)
-	if cfg := f.Cfg.Storage.Bucket; cfg.Backend != "filesystem" {
+	if cfg := f.Cfg.Storage.Bucket; cfg.Backend != objstoreclient.None {
+		if cfg.Backend == objstoreclient.Filesystem {
+			level.Warn(f.logger).Log("msg", "when running with storage.backend 'filesystem' it is important that all replicas/components share the same filesystem")
+		}
 		b, err := objstoreclient.NewBucket(
 			f.context(),
 			cfg,
@@ -354,7 +399,7 @@ func (f *Phlare) context() context.Context {
 func (f *Phlare) initIngester() (_ services.Service, err error) {
 	f.Cfg.Ingester.LifecyclerConfig.ListenPort = f.Cfg.Server.HTTPListenPort
 
-	svc, err := ingester.New(f.context(), f.Cfg.Ingester, f.Cfg.PhlareDB, f.storageBucket, f.Overrides)
+	svc, err := ingester.New(f.context(), f.Cfg.Ingester, f.Cfg.PhlareDB, f.storageBucket, f.Overrides, f.Cfg.Querier.QueryStoreAfter)
 	if err != nil {
 		return nil, err
 	}
@@ -365,7 +410,10 @@ func (f *Phlare) initIngester() (_ services.Service, err error) {
 }
 
 func (f *Phlare) initStoreGateway() (serv services.Service, err error) {
-	f.Cfg.StoreGateway.ShardingRing.ListenPort = f.Cfg.Server.HTTPListenPort
+	f.Cfg.StoreGateway.ShardingRing.Ring.ListenPort = f.Cfg.Server.HTTPListenPort
+	if f.storageBucket == nil {
+		return nil, nil
+	}
 
 	svc, err := storegateway.NewStoreGateway(f.Cfg.StoreGateway, f.storageBucket, f.Overrides, f.logger, f.reg)
 	if err != nil {
@@ -374,6 +422,16 @@ func (f *Phlare) initStoreGateway() (serv services.Service, err error) {
 	f.API.RegisterStoreGateway(svc)
 	return svc, nil
 }
+
+var objstoreTracerMiddleware = middleware.Func(func(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if tracer := opentracing.GlobalTracer(); tracer != nil {
+			ctx = objstoretracing.ContextWithTracer(ctx, opentracing.GlobalTracer())
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+})
 
 func (f *Phlare) initServer() (services.Service, error) {
 	f.reg.MustRegister(version.NewCollector("pyroscope"))
@@ -425,6 +483,7 @@ func (f *Phlare) initServer() (services.Service, error) {
 			LogRequestAtInfoLevel: f.Cfg.Server.LogRequestAtInfoLevel,
 		},
 		httpMetric,
+		objstoreTracerMiddleware,
 	}
 	f.Server.HTTPServer.Handler = middleware.Merge(defaultHTTPMiddleware...).Wrap(f.Server.HTTP)
 
@@ -472,6 +531,22 @@ func (f *Phlare) initUsageReport() (services.Service, error) {
 	}
 	f.usageReport = ur
 	return ur, nil
+}
+
+func (f *Phlare) initAdmin() (services.Service, error) {
+	if f.storageBucket == nil {
+		level.Warn(f.logger).Log("msg", "no storage bucket configured, the admin component will not be loaded")
+		return nil, nil
+	}
+
+	a, err := operations.NewAdmin(f.storageBucket, f.logger, f.Cfg.PhlareDB.MaxBlockDuration)
+	if err != nil {
+		level.Info(f.logger).Log("msg", "failed to initialize admin", "err", err)
+		return nil, nil
+	}
+	f.admin = a
+	f.API.RegisterAdmin(a)
+	return a, nil
 }
 
 type statusService struct {

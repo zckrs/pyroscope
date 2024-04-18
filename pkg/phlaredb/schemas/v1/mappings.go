@@ -1,7 +1,7 @@
 package v1
 
 import (
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 
 	profilev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
 )
@@ -72,4 +72,9 @@ type InMemoryMapping struct {
 	HasFilenames    bool
 	HasLineNumbers  bool
 	HasInlineFrames bool
+}
+
+func (m *InMemoryMapping) Clone() *InMemoryMapping {
+	n := *m
+	return &n
 }

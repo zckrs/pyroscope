@@ -13,10 +13,10 @@ import (
 	"github.com/go-kit/log"
 	"github.com/google/pprof/profile"
 	"github.com/google/uuid"
+	"github.com/parquet-go/parquet-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/samber/lo"
-	"github.com/segmentio/parquet-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -24,12 +24,32 @@ import (
 	ingestv1 "github.com/grafana/pyroscope/api/gen/proto/go/ingester/v1"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
 	phlaremodel "github.com/grafana/pyroscope/pkg/model"
+	phlareobj "github.com/grafana/pyroscope/pkg/objstore"
+	phlareobjclient "github.com/grafana/pyroscope/pkg/objstore/client"
 	phlarecontext "github.com/grafana/pyroscope/pkg/phlare/context"
 	schemav1 "github.com/grafana/pyroscope/pkg/phlaredb/schemas/v1"
 	"github.com/grafana/pyroscope/pkg/pprof/testhelper"
 )
 
-func testContext(t testing.TB) context.Context {
+const (
+	contextKeyDataDir contextKey = iota + 32
+)
+
+func contextWithDataDir(ctx context.Context, path string) context.Context {
+	return context.WithValue(ctx, contextKeyDataDir, path)
+}
+
+func contextDataDir(ctx context.Context) string {
+	return ctx.Value(contextKeyDataDir).(string)
+}
+
+type testCtx struct {
+	context.Context
+	dataDir           string
+	localBucketClient phlareobj.Bucket
+}
+
+func testContext(t testing.TB) testCtx {
 	logger := log.NewNopLogger()
 	if testing.Verbose() {
 		logger = log.NewLogfmtLogger(os.Stderr)
@@ -42,9 +62,21 @@ func testContext(t testing.TB) context.Context {
 
 	reg := prometheus.NewPedanticRegistry()
 	ctx = phlarecontext.WithRegistry(ctx, reg)
-	ctx = contextWithHeadMetrics(ctx, newHeadMetrics(reg))
 
-	return ctx
+	dataPath := t.TempDir()
+	ctx = contextWithDataDir(ctx, dataPath)
+	bucketCfg := phlareobjclient.Config{}
+	bucketCfg.Backend = phlareobjclient.Filesystem
+	bucketCfg.Filesystem.Directory = dataPath
+	bucketClient, err := phlareobjclient.NewBucket(ctx, bucketCfg, "testing")
+	require.NoError(t, err)
+
+	ctx = contextWithHeadMetrics(ctx, newHeadMetrics(reg))
+	return testCtx{
+		Context:           ctx,
+		dataDir:           dataPath,
+		localBucketClient: bucketClient,
+	}
 }
 
 type testProfile struct {
@@ -204,7 +236,7 @@ func TestProfileStore_RowGroupSplitting(t *testing.T) {
 
 			for i := 0; i < 100; i++ {
 				p := tc.values(i)
-				require.NoError(t, store.ingest(ctx, []schemav1.InMemoryProfile{p.p}, p.lbls, p.profileName, emptyRewriter()))
+				require.NoError(t, store.ingest(ctx, []schemav1.InMemoryProfile{p.p}, p.lbls, p.profileName))
 				for store.flushing.Load() {
 					time.Sleep(time.Millisecond)
 				}
@@ -270,7 +302,7 @@ func TestProfileStore_Ingestion_SeriesIndexes(t *testing.T) {
 
 	for i := 0; i < 9; i++ {
 		p := threeProfileStreams(i)
-		require.NoError(t, store.ingest(ctx, []schemav1.InMemoryProfile{p.p}, p.lbls, p.profileName, emptyRewriter()))
+		require.NoError(t, store.ingest(ctx, []schemav1.InMemoryProfile{p.p}, p.lbls, p.profileName))
 	}
 
 	// flush profiles and ensure the correct number of files are created
@@ -295,7 +327,6 @@ func BenchmarkFlush(b *testing.B) {
 	b.StopTimer()
 	ctx := testContext(b)
 	metrics := newHeadMetrics(prometheus.NewRegistry())
-	rw := emptyRewriter()
 	b.ReportAllocs()
 	samples := schemav1.Samples{
 		Values:        make([]uint64, 10000),
@@ -314,7 +345,7 @@ func BenchmarkFlush(b *testing.B) {
 			for i := 0; i < 10^6; i++ {
 				p := threeProfileStreams(i)
 				p.p.Samples = samples
-				require.NoError(b, store.ingest(ctx, []schemav1.InMemoryProfile{p.p}, p.lbls, p.profileName, rw))
+				require.NoError(b, store.ingest(ctx, []schemav1.InMemoryProfile{p.p}, p.lbls, p.profileName))
 			}
 			require.NoError(b, store.cutRowGroup(len(store.slice)))
 		}
@@ -563,4 +594,16 @@ func TestProfileStore_Querying(t *testing.T) {
 			values,
 		)
 	})
+}
+
+func TestRemoveFailedSegment(t *testing.T) {
+	store := newProfileStore(testContext(t))
+	dir := t.TempDir()
+	require.NoError(t, store.Init(dir, defaultParquetConfig, contextHeadMetrics(context.Background())))
+	// fake a failed segment
+	_, err := os.Create(dir + "/profiles.0.parquet")
+	require.NoError(t, store.ingest(context.Background(), []schemav1.InMemoryProfile{{}}, phlaremodel.LabelsFromStrings(), "memory"))
+	require.NoError(t, err)
+	err = store.cutRowGroup(1)
+	require.NoError(t, err)
 }

@@ -2,15 +2,17 @@ package phlaredb
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
+	"github.com/dustin/go-humanize"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
@@ -18,19 +20,24 @@ import (
 	"github.com/grafana/dskit/services"
 	"github.com/oklog/ulid"
 	"github.com/opentracing/opentracing-go"
-	otlog "github.com/opentracing/opentracing-go/log"
-	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/samber/lo"
 
 	profilev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
 	ingestv1 "github.com/grafana/pyroscope/api/gen/proto/go/ingester/v1"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
-	"github.com/grafana/pyroscope/pkg/iter"
 	phlaremodel "github.com/grafana/pyroscope/pkg/model"
 	phlareobj "github.com/grafana/pyroscope/pkg/objstore"
-	"github.com/grafana/pyroscope/pkg/objstore/providers/filesystem"
 	phlarecontext "github.com/grafana/pyroscope/pkg/phlare/context"
 	"github.com/grafana/pyroscope/pkg/phlaredb/block"
+	"github.com/grafana/pyroscope/pkg/util"
+)
+
+const (
+	DefaultMinFreeDisk                        = 10
+	DefaultMinDiskAvailablePercentage         = 0.05
+	DefaultRetentionPolicyEnforcementInterval = 5 * time.Minute
+	DefaultRetentionExpiry                    = 4 * time.Hour // Same as default `querier.query_store_after`.
 )
 
 type Config struct {
@@ -41,7 +48,12 @@ type Config struct {
 	// TODO: docs
 	RowGroupTargetSize uint64 `yaml:"row_group_target_size"`
 
-	Parquet *ParquetConfig `yaml:"-"` // Those configs should not be exposed to the user, rather they should be determined by phlare itself. Currently, they are solely used for test cases.
+	Parquet *ParquetConfig `yaml:"-"` // Those configs should not be exposed to the user, rather they should be determined by pyroscope itself. Currently, they are solely used for test cases.
+
+	MinFreeDisk                uint64        `yaml:"min_free_disk_gb"`
+	MinDiskAvailablePercentage float64       `yaml:"min_disk_available_percentage"`
+	EnforcementInterval        time.Duration `yaml:"enforcement_interval"`
+	DisableEnforcement         bool          `yaml:"disable_enforcement"`
 }
 
 type ParquetConfig struct {
@@ -51,9 +63,13 @@ type ParquetConfig struct {
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.DataPath, "phlaredb.data-path", "./data", "Directory used for local storage.")
-	f.DurationVar(&cfg.MaxBlockDuration, "phlaredb.max-block-duration", 3*time.Hour, "Upper limit to the duration of a Phlare block.")
-	f.Uint64Var(&cfg.RowGroupTargetSize, "phlaredb.row-group-target-size", 10*128*1024*1024, "How big should a single row group be uncompressed") // This should roughly be 128MiB compressed
+	f.StringVar(&cfg.DataPath, "pyroscopedb.data-path", "./data", "Directory used for local storage.")
+	f.DurationVar(&cfg.MaxBlockDuration, "pyroscopedb.max-block-duration", 1*time.Hour, "Upper limit to the duration of a Pyroscope block.")
+	f.Uint64Var(&cfg.RowGroupTargetSize, "pyroscopedb.row-group-target-size", 10*128*1024*1024, "How big should a single row group be uncompressed") // This should roughly be 128MiB compressed
+	f.Uint64Var(&cfg.MinFreeDisk, "pyroscopedb.retention-policy-min-free-disk-gb", DefaultMinFreeDisk, "How much available disk space to keep in GiB")
+	f.Float64Var(&cfg.MinDiskAvailablePercentage, "pyroscopedb.retention-policy-min-disk-available-percentage", DefaultMinDiskAvailablePercentage, "Which percentage of free disk space to keep")
+	f.DurationVar(&cfg.EnforcementInterval, "pyroscopedb.retention-policy-enforcement-interval", DefaultRetentionPolicyEnforcementInterval, "How often to enforce disk retention")
+	f.BoolVar(&cfg.DisableEnforcement, "pyroscopedb.retention-policy-disable", false, "Disable retention policy enforcement")
 }
 
 type TenantLimiter interface {
@@ -66,57 +82,54 @@ type PhlareDB struct {
 
 	logger    log.Logger
 	phlarectx context.Context
+	metrics   *headMetrics
 
 	cfg    Config
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 
 	headLock sync.RWMutex
-	// Head for ingest requests and reads. May not be present,
+	// Heads per max range interval for ingest requests and reads. May be empty,
 	// if no ingestion requests were handled.
-	head *Head
-	// Read only head. On Flush, writes are directed to
+	heads map[int64]*Head
+	// Read only heads. On Flush, writes are directed to
 	// the new head, and queries can read the former head
 	// till it gets written to the disk and becomes available
 	// to blockQuerier.
-	oldHead *Head
+	flushing []*Head
+
 	// flushLock serializes flushes. Only one flush at a time
 	// is allowed.
 	flushLock sync.Mutex
-	headInit  chan struct{} // Closes every time a new head is initialized.
 
 	blockQuerier *BlockQuerier
 	limiter      TenantLimiter
 	evictCh      chan *blockEviction
 }
 
-func New(phlarectx context.Context, cfg Config, limiter TenantLimiter) (*PhlareDB, error) {
-	// todo: should be instrumented.
-	fs, err := filesystem.NewBucket(cfg.DataPath)
-	if err != nil {
-		return nil, err
+func New(phlarectx context.Context, cfg Config, limiter TenantLimiter, fs phlareobj.Bucket) (*PhlareDB, error) {
+	reg := phlarecontext.Registry(phlarectx)
+	f := &PhlareDB{
+		cfg:     cfg,
+		logger:  phlarecontext.Logger(phlarectx),
+		stopCh:  make(chan struct{}),
+		evictCh: make(chan *blockEviction),
+		metrics: newHeadMetrics(reg),
+		limiter: limiter,
+		heads:   make(map[int64]*Head),
 	}
 
-	f := &PhlareDB{
-		cfg:      cfg,
-		logger:   phlarecontext.Logger(phlarectx),
-		stopCh:   make(chan struct{}),
-		evictCh:  make(chan *blockEviction),
-		headInit: make(chan struct{}),
-		limiter:  limiter,
-	}
 	if err := os.MkdirAll(f.LocalDataPath(), 0o777); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", f.LocalDataPath(), err)
 	}
-	reg := phlarecontext.Registry(phlarectx)
 
 	// ensure head metrics are registered early so they are reused for the new head
-	phlarectx = contextWithHeadMetrics(phlarectx, newHeadMetrics(reg))
+	phlarectx = contextWithHeadMetrics(phlarectx, f.metrics)
 	f.phlarectx = phlarectx
 	f.wg.Add(1)
 	go f.loop()
 
-	f.blockQuerier = NewBlockQuerier(phlarectx, phlareobj.NewPrefixedBucket(fs, pathLocal))
+	f.blockQuerier = NewBlockQuerier(phlarectx, phlareobj.NewPrefixedBucket(fs, PathLocal))
 
 	// do an initial querier sync
 	ctx := context.Background()
@@ -127,7 +140,7 @@ func New(phlarectx context.Context, cfg Config, limiter TenantLimiter) (*PhlareD
 }
 
 func (f *PhlareDB) LocalDataPath() string {
-	return filepath.Join(f.cfg.DataPath, pathLocal)
+	return filepath.Join(f.cfg.DataPath, PathLocal)
 }
 
 func (f *PhlareDB) BlockMetas(ctx context.Context) ([]*block.Meta, error) {
@@ -142,8 +155,13 @@ func (f *PhlareDB) runBlockQuerierSync(ctx context.Context) {
 
 func (f *PhlareDB) loop() {
 	blockScanTicker := time.NewTicker(5 * time.Minute)
+	headSizeCheck := time.NewTicker(5 * time.Second)
+	staleHeadTicker := time.NewTimer(util.DurationWithJitter(10*time.Minute, 0.5))
+	maxBlockBytes := f.maxBlockBytes()
 	defer func() {
 		blockScanTicker.Stop()
+		headSizeCheck.Stop()
+		staleHeadTicker.Stop()
 		f.wg.Done()
 	}()
 
@@ -153,47 +171,110 @@ func (f *PhlareDB) loop() {
 		select {
 		case <-f.stopCh:
 			return
-		case <-f.headFlushCh():
-			if err := f.Flush(ctx); err != nil {
-				level.Error(f.logger).Log("msg", "flushing head block failed", "err", err)
-				continue
-			}
-			f.runBlockQuerierSync(ctx)
 		case <-blockScanTicker.C:
 			f.runBlockQuerierSync(ctx)
+		case <-headSizeCheck.C:
+			if f.headSize() > maxBlockBytes {
+				f.Flush(ctx, true, flushReasonMaxBlockBytes)
+			}
+		case <-staleHeadTicker.C:
+			f.Flush(ctx, false, flushReasonMaxDuration)
+			staleHeadTicker.Reset(util.DurationWithJitter(10*time.Minute, 0.5))
 		case e := <-f.evictCh:
 			f.evictBlock(e)
-		case <-f.headInit:
-			// headFlushCh() may actually be stopCh. When a new head is
-			// initialized, we re-build the select channel list, and get
-			// a valid flush channel of the new head.
-			f.headLock.Lock()
-			f.headInit = make(chan struct{})
-			f.headLock.Unlock()
 		}
 	}
 }
 
-// initHead initializes a new head and signals to the main closing the
-// headInit channel: must only be called with headLock held for writes.
-func (f *PhlareDB) initHead() (err error) {
-	if f.head, err = NewHead(f.phlarectx, f.cfg, f.limiter); err != nil {
-		return err
+// Flush start flushing heads to disk.
+// When force is true, all heads are flushed.
+// When force is false, only stale heads are flushed.
+// see Head.isStale for the definition of stale.
+func (f *PhlareDB) Flush(ctx context.Context, force bool, reason string) (err error) {
+	// Ensure this is the only Flush running.
+	f.flushLock.Lock()
+	defer f.flushLock.Unlock()
+
+	currentSize := f.headSize()
+	f.headLock.Lock()
+	if len(f.heads) == 0 {
+		f.headLock.Unlock()
+		return nil
 	}
-	close(f.headInit) // Now can select from f.head.flushCh (headFlushCh).
-	return nil
+
+	// sweep heads for flushing
+	f.flushing = make([]*Head, 0, len(f.heads))
+	for maxT, h := range f.heads {
+		// Skip heads that are not stale.
+		if h.isStale(maxT, time.Now()) || force {
+			f.flushing = append(f.flushing, h)
+			delete(f.heads, maxT)
+		}
+	}
+
+	if len(f.flushing) != 0 {
+		level.Debug(f.logger).Log(
+			"msg", "flushing heads to disk",
+			"reason", reason,
+			"max_size", humanize.Bytes(f.maxBlockBytes()),
+			"current_size", humanize.Bytes(currentSize),
+			"num_heads", len(f.flushing),
+		)
+	}
+
+	f.headLock.Unlock()
+	// lock is release flushing heads are available for queries in the flushing array.
+	// New heads can be created and written to while the flushing heads are being flushed.
+	errs := multierror.New()
+
+	// flush all heads and keep only successful ones
+	successful := lo.Filter(f.flushing, func(h *Head, index int) bool {
+		f.metrics.flushedBlocksReasons.WithLabelValues(reason).Inc()
+		if err := h.Flush(ctx); err != nil {
+			errs.Add(err)
+			return false
+		}
+		return true
+	})
+
+	// At this point we ensure that the data has been flushed on disk.
+	// Now we need to make it "visible" to queries, and close the old
+	// head once in-flight queries finish.
+	// TODO(kolesnikovae): Although the head move is supposed to be a quick
+	//  operation, consider making the lock more selective and block only
+	//  queries that target the old head.
+	f.headLock.Lock()
+	// Now that there are no in-flight queries we can move the head.
+	successful = lo.Filter(successful, func(h *Head, index int) bool {
+		if err := h.Move(); err != nil {
+			errs.Add(err)
+			return false
+		}
+		return true
+	})
+	// Add heads that were flushed and moved to the blockQuerier.
+	for _, h := range successful {
+		f.blockQuerier.AddBlockQuerierByMeta(h.meta)
+	}
+	f.flushing = nil
+	f.headLock.Unlock()
+	return err
 }
 
-func (f *PhlareDB) headFlushCh() chan struct{} {
-	f.headLock.RLock()
-	defer f.headLock.RUnlock()
-	if h := f.head; h != nil {
-		return h.flushCh
+func (f *PhlareDB) maxBlockDuration() time.Duration {
+	maxBlockDuration := 5 * time.Second
+	if f.cfg.MaxBlockDuration > maxBlockDuration {
+		maxBlockDuration = f.cfg.MaxBlockDuration
 	}
-	// It is okay to return stopCh: Flush can be called when
-	// no head exists; it will return immediately. When a new
-	// head is initialized, headFlushCh must be called again.
-	return f.stopCh
+	return maxBlockDuration
+}
+
+func (f *PhlareDB) maxBlockBytes() uint64 {
+	maxBlockBytes := defaultParquetConfig.MaxBlockBytes
+	if f.cfg.Parquet != nil && f.cfg.Parquet.MaxBlockBytes > 0 {
+		maxBlockBytes = f.cfg.Parquet.MaxBlockBytes
+	}
+	return maxBlockBytes
 }
 
 func (f *PhlareDB) evictBlock(e *blockEviction) {
@@ -208,8 +289,8 @@ func (f *PhlareDB) Close() error {
 	close(f.stopCh)
 	f.wg.Wait()
 	errs := multierror.New()
-	if f.head != nil {
-		errs.Add(f.head.Flush(f.phlarectx))
+	for _, h := range f.heads {
+		errs.Add(h.Flush(f.phlarectx))
 	}
 	close(f.evictCh)
 	if err := f.blockQuerier.Close(); err != nil {
@@ -221,293 +302,168 @@ func (f *PhlareDB) Close() error {
 
 func (f *PhlareDB) queriers() Queriers {
 	queriers := f.blockQuerier.Queriers()
-	var head Queriers
-	if f.head != nil {
-		head = f.head.Queriers()
+	head := f.headQueriers()
+	return append(queriers, head...)
+}
+
+func (f *PhlareDB) headQueriers() Queriers {
+	res := make(Queriers, 0, len(f.heads)+len(f.flushing))
+	for _, h := range f.heads {
+		res = append(res, h.Queriers()...)
 	}
-	var oldHead Queriers
-	if f.oldHead != nil {
-		oldHead = f.oldHead.Queriers()
+	for _, h := range f.flushing {
+		res = append(res, h.Queriers()...)
 	}
-	res := make(Queriers, 0, len(queriers)+len(head)+len(oldHead))
-	res = append(res, queriers...)
-	res = append(res, head...)
-	res = append(res, oldHead...)
 	return res
 }
 
 func (f *PhlareDB) Ingest(ctx context.Context, p *profilev1.Profile, id uuid.UUID, externalLabels ...*typesv1.LabelPair) (err error) {
-	return f.withHeadForIngest(func(head *Head) error {
+	return f.headForIngest(p.TimeNanos, func(head *Head) error {
 		return head.Ingest(ctx, p, id, externalLabels...)
 	})
 }
 
-func (f *PhlareDB) withHeadForIngest(fn func(*Head) error) (err error) {
+func endRangeForTimestamp(t, width int64) (maxt int64) {
+	return (t/width)*width + width
+}
+
+// headForIngest returns the head assigned for the range where the given sampleTimeNanos falls.
+// We hold multiple heads and assign them a fixed range of timestamps.
+// This helps make block range fixed and predictable.
+func (f *PhlareDB) headForIngest(sampleTimeNanos int64, fn func(*Head) error) (err error) {
+	// we use the maxT of fixed interval as the key to the head map
+	maxT := endRangeForTimestamp(sampleTimeNanos, f.maxBlockDuration().Nanoseconds())
 	// We need to keep track of the in-flight ingestion requests to ensure that none
 	// of them will compete with Flush. Lock is acquired to avoid Add after Wait that
 	// is called in the very beginning of Flush.
 	f.headLock.RLock()
-	h := f.head
-	if h != nil {
+	if h := f.heads[maxT]; h != nil {
 		h.inFlightProfiles.Add(1)
 		f.headLock.RUnlock()
 		defer h.inFlightProfiles.Done()
 		return fn(h)
 	}
+
 	f.headLock.RUnlock()
 	f.headLock.Lock()
-	h = f.head
-	if h != nil {
-		h.inFlightProfiles.Add(1)
-		f.headLock.Unlock()
-		defer h.inFlightProfiles.Done()
-		return fn(h)
+	head, ok := f.heads[maxT]
+	if !ok {
+		h, err := NewHead(f.phlarectx, f.cfg, f.limiter)
+		if err != nil {
+			f.headLock.Unlock()
+			return err
+		}
+		head = h
+		f.heads[maxT] = head
 	}
-	if err = f.initHead(); err != nil {
-		f.headLock.Unlock()
-		return err
-	}
-	h = f.head
+	h := head
 	h.inFlightProfiles.Add(1)
 	f.headLock.Unlock()
 	defer h.inFlightProfiles.Done()
 	return fn(h)
 }
 
-func withHeadForQuery[T any](f *PhlareDB, fn func(*Head) (*connect.Response[T], error)) (*connect.Response[T], error) {
+func (f *PhlareDB) headSize() uint64 {
 	f.headLock.RLock()
 	defer f.headLock.RUnlock()
-	h := f.head
-	if h == nil {
-		return connect.NewResponse(new(T)), nil
+	size := uint64(0)
+	for _, h := range f.heads {
+		size += h.Size()
 	}
-	return fn(h)
+	return size
 }
+
+const (
+	flushReasonMaxDuration   = "max-duration"
+	flushReasonMaxBlockBytes = "max-block-bytes"
+)
 
 // LabelValues returns the possible label values for a given label name.
 func (f *PhlareDB) LabelValues(ctx context.Context, req *connect.Request[typesv1.LabelValuesRequest]) (resp *connect.Response[typesv1.LabelValuesResponse], err error) {
-	return withHeadForQuery(f, func(head *Head) (*connect.Response[typesv1.LabelValuesResponse], error) {
-		return head.LabelValues(ctx, req)
-	})
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "PhlareDB LabelValues")
+	defer sp.Finish()
+
+	f.headLock.RLock()
+	defer f.headLock.RUnlock()
+
+	_, ok := phlaremodel.GetTimeRange(req.Msg)
+	if !ok {
+		return f.headQueriers().LabelValues(ctx, req)
+	}
+	return f.queriers().LabelValues(ctx, req)
 }
 
 // LabelNames returns the possible label names.
-func (f *PhlareDB) LabelNames(ctx context.Context, req *connect.Request[typesv1.LabelNamesRequest]) (resp *connect.Response[typesv1.LabelNamesResponse], err error) {
-	return withHeadForQuery(f, func(head *Head) (*connect.Response[typesv1.LabelNamesResponse], error) {
-		return head.LabelNames(ctx, req)
-	})
+func (f *PhlareDB) LabelNames(ctx context.Context, req *connect.Request[typesv1.LabelNamesRequest]) (*connect.Response[typesv1.LabelNamesResponse], error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "PhlareDB LabelNames")
+	defer sp.Finish()
+
+	f.headLock.RLock()
+	defer f.headLock.RUnlock()
+
+	_, ok := phlaremodel.GetTimeRange(req.Msg)
+	if !ok {
+		return f.headQueriers().LabelNames(ctx, req)
+	}
+	return f.queriers().LabelNames(ctx, req)
 }
 
 // ProfileTypes returns the possible profile types.
 func (f *PhlareDB) ProfileTypes(ctx context.Context, req *connect.Request[ingestv1.ProfileTypesRequest]) (resp *connect.Response[ingestv1.ProfileTypesResponse], err error) {
-	return withHeadForQuery(f, func(head *Head) (*connect.Response[ingestv1.ProfileTypesResponse], error) {
-		return head.ProfileTypes(ctx, req)
-	})
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "PhlareDB ProfileTypes")
+	defer sp.Finish()
+
+	f.headLock.RLock()
+	defer f.headLock.RUnlock()
+
+	_, ok := phlaremodel.GetTimeRange(req.Msg)
+	if !ok {
+		return f.headQueriers().ProfileTypes(ctx, req)
+	}
+	return f.queriers().ProfileTypes(ctx, req)
 }
 
 // Series returns labels series for the given set of matchers.
-func (f *PhlareDB) Series(ctx context.Context, req *connect.Request[ingestv1.SeriesRequest]) (resp *connect.Response[ingestv1.SeriesResponse], err error) {
-	return withHeadForQuery(f, func(head *Head) (*connect.Response[ingestv1.SeriesResponse], error) {
-		return head.Series(ctx, req)
-	})
+func (f *PhlareDB) Series(ctx context.Context, req *connect.Request[ingestv1.SeriesRequest]) (*connect.Response[ingestv1.SeriesResponse], error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "PhlareDB Series")
+	defer sp.Finish()
+
+	f.headLock.RLock()
+	defer f.headLock.RUnlock()
+
+	_, ok := phlaremodel.GetTimeRange(req.Msg)
+	if !ok {
+		return f.headQueriers().Series(ctx, req)
+	}
+	return f.queriers().Series(ctx, req)
 }
 
 func (f *PhlareDB) MergeProfilesStacktraces(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeProfilesStacktracesRequest, ingestv1.MergeProfilesStacktracesResponse]) error {
 	f.headLock.RLock()
 	defer f.headLock.RUnlock()
-	return MergeProfilesStacktraces(ctx, stream, f.queriers().ForTimeRange)
+
+	return f.queriers().MergeProfilesStacktraces(ctx, stream)
 }
 
 func (f *PhlareDB) MergeProfilesLabels(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeProfilesLabelsRequest, ingestv1.MergeProfilesLabelsResponse]) error {
 	f.headLock.RLock()
 	defer f.headLock.RUnlock()
-	return MergeProfilesLabels(ctx, stream, f.queriers().ForTimeRange)
+
+	return f.queriers().MergeProfilesLabels(ctx, stream)
 }
 
 func (f *PhlareDB) MergeProfilesPprof(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeProfilesPprofRequest, ingestv1.MergeProfilesPprofResponse]) error {
 	f.headLock.RLock()
 	defer f.headLock.RUnlock()
-	return MergeProfilesPprof(ctx, stream, f.queriers().ForTimeRange)
+
+	return f.queriers().MergeProfilesPprof(ctx, stream)
 }
 
-type BidiServerMerge[Res any, Req any] interface {
-	Send(Res) error
-	Receive() (Req, error)
-}
+func (f *PhlareDB) MergeSpanProfile(ctx context.Context, stream *connect.BidiStream[ingestv1.MergeSpanProfileRequest, ingestv1.MergeSpanProfileResponse]) error {
+	f.headLock.RLock()
+	defer f.headLock.RUnlock()
 
-type labelWithIndex struct {
-	phlaremodel.Labels
-	index int
-}
-
-type ProfileWithIndex struct {
-	Profile
-	Index int
-}
-
-type indexedProfileIterator struct {
-	iter.Iterator[Profile]
-	querierIndex int
-}
-
-func (pqi *indexedProfileIterator) At() ProfileWithIndex {
-	return ProfileWithIndex{
-		Profile: pqi.Iterator.At(),
-		Index:   pqi.querierIndex,
-	}
-}
-
-// filterProfiles merges and dedupe profiles from different iterators and allow filtering via a bidi stream.
-func filterProfiles[B BidiServerMerge[Res, Req],
-	Res *ingestv1.MergeProfilesStacktracesResponse | *ingestv1.MergeProfilesLabelsResponse | *ingestv1.MergeProfilesPprofResponse,
-	Req *ingestv1.MergeProfilesStacktracesRequest | *ingestv1.MergeProfilesLabelsRequest | *ingestv1.MergeProfilesPprofRequest](
-	ctx context.Context, profiles []iter.Iterator[Profile], batchProfileSize int, stream B,
-) ([][]Profile, error) {
-	selection := make([][]Profile, len(profiles))
-	selectProfileResult := &ingestv1.ProfileSets{
-		Profiles:   make([]*ingestv1.SeriesProfile, 0, batchProfileSize),
-		LabelsSets: make([]*typesv1.Labels, 0, batchProfileSize),
-	}
-	its := make([]iter.Iterator[ProfileWithIndex], len(profiles))
-	for i, iter := range profiles {
-		iter := iter
-		its[i] = &indexedProfileIterator{
-			Iterator:     iter,
-			querierIndex: i,
-		}
-	}
-	if err := iter.ReadBatch(ctx, iter.NewMergeIterator(ProfileWithIndex{
-		Profile: maxBlockProfile,
-		Index:   0,
-	}, true, its...), batchProfileSize, func(ctx context.Context, batch []ProfileWithIndex) error {
-		sp, _ := opentracing.StartSpanFromContext(ctx, "filterProfiles - Filtering batch")
-		sp.LogFields(
-			otlog.Int("batch_len", len(batch)),
-			otlog.Int("batch_requested_size", batchProfileSize),
-		)
-		defer sp.Finish()
-
-		seriesByFP := map[model.Fingerprint]labelWithIndex{}
-		selectProfileResult.LabelsSets = selectProfileResult.LabelsSets[:0]
-		selectProfileResult.Profiles = selectProfileResult.Profiles[:0]
-
-		for _, profile := range batch {
-			var ok bool
-			var lblsIdx labelWithIndex
-			lblsIdx, ok = seriesByFP[profile.Fingerprint()]
-			if !ok {
-				lblsIdx = labelWithIndex{
-					Labels: profile.Labels(),
-					index:  len(selectProfileResult.LabelsSets),
-				}
-				seriesByFP[profile.Fingerprint()] = lblsIdx
-				selectProfileResult.LabelsSets = append(selectProfileResult.LabelsSets, &typesv1.Labels{Labels: profile.Labels()})
-			}
-			selectProfileResult.Profiles = append(selectProfileResult.Profiles, &ingestv1.SeriesProfile{
-				LabelIndex: int32(lblsIdx.index),
-				Timestamp:  int64(profile.Timestamp()),
-			})
-
-		}
-		sp.LogFields(otlog.String("msg", "sending batch to client"))
-		var err error
-		switch s := BidiServerMerge[Res, Req](stream).(type) {
-		case BidiServerMerge[*ingestv1.MergeProfilesStacktracesResponse, *ingestv1.MergeProfilesStacktracesRequest]:
-			err = s.Send(&ingestv1.MergeProfilesStacktracesResponse{
-				SelectedProfiles: selectProfileResult,
-			})
-		case BidiServerMerge[*ingestv1.MergeProfilesLabelsResponse, *ingestv1.MergeProfilesLabelsRequest]:
-			err = s.Send(&ingestv1.MergeProfilesLabelsResponse{
-				SelectedProfiles: selectProfileResult,
-			})
-		case BidiServerMerge[*ingestv1.MergeProfilesPprofResponse, *ingestv1.MergeProfilesPprofRequest]:
-			err = s.Send(&ingestv1.MergeProfilesPprofResponse{
-				SelectedProfiles: selectProfileResult,
-			})
-		}
-		// read a batch of profiles and sends it.
-
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return connect.NewError(connect.CodeCanceled, errors.New("client closed stream"))
-			}
-			return err
-		}
-		sp.LogFields(otlog.String("msg", "batch sent to client"))
-
-		sp.LogFields(otlog.String("msg", "reading selection from client"))
-
-		// handle response for the batch.
-		var selected []bool
-		switch s := BidiServerMerge[Res, Req](stream).(type) {
-		case BidiServerMerge[*ingestv1.MergeProfilesStacktracesResponse, *ingestv1.MergeProfilesStacktracesRequest]:
-			selectionResponse, err := s.Receive()
-			if err == nil {
-				selected = selectionResponse.Profiles
-			}
-		case BidiServerMerge[*ingestv1.MergeProfilesLabelsResponse, *ingestv1.MergeProfilesLabelsRequest]:
-			selectionResponse, err := s.Receive()
-			if err == nil {
-				selected = selectionResponse.Profiles
-			}
-		case BidiServerMerge[*ingestv1.MergeProfilesPprofResponse, *ingestv1.MergeProfilesPprofRequest]:
-			selectionResponse, err := s.Receive()
-			if err == nil {
-				selected = selectionResponse.Profiles
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return connect.NewError(connect.CodeCanceled, errors.New("client closed stream"))
-			}
-			return err
-		}
-		sp.LogFields(otlog.String("msg", "selection received"))
-		for i, k := range selected {
-			if k {
-				selection[batch[i].Index] = append(selection[batch[i].Index], batch[i].Profile)
-			}
-		}
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	return selection, nil
-}
-
-func (f *PhlareDB) Flush(ctx context.Context) (err error) {
-	// Ensure this is the only Flush running.
-	f.flushLock.Lock()
-	defer f.flushLock.Unlock()
-	// Create a new head and evict the old one. Reads and writes
-	// are blocked – after the lock is released, no new ingestion
-	// requests will be arriving to the old head.
-	f.headLock.Lock()
-	if f.head == nil {
-		f.headLock.Unlock()
-		return nil
-	}
-	f.oldHead, f.head = f.head, nil
-	f.headLock.Unlock()
-	// Old head is available to readers during Flush.
-	if err = f.oldHead.Flush(ctx); err != nil {
-		return err
-	}
-	// At this point we ensure that the data has been flushed on disk.
-	// Now we need to make it "visible" to queries, and close the old
-	// head once in-flight queries finish.
-	// TODO(kolesnikovae): Although the head move is supposed to be a quick
-	//  operation, consider making the lock more selective and block only
-	//  queries that target the old head.
-	f.headLock.Lock()
-	// Now that there are no in-flight queries we can move the head.
-	err = f.oldHead.Move()
-	// Propagate the new block to blockQuerier.
-	f.blockQuerier.AddBlockQuerierByMeta(f.oldHead.meta)
-	f.oldHead = nil
-	f.headLock.Unlock()
-	// The old in-memory head is not available to queries from now on.
-	return err
+	return f.queriers().MergeSpanProfile(ctx, stream)
 }
 
 type blockEviction struct {
@@ -533,4 +489,94 @@ func (f *PhlareDB) Evict(blockID ulid.ULID, fn func() error) (bool, error) {
 	f.evictCh <- e
 	<-e.done
 	return e.evicted, e.err
+}
+
+func (f *PhlareDB) BlockMetadata(ctx context.Context, req *connect.Request[ingestv1.BlockMetadataRequest]) (*connect.Response[ingestv1.BlockMetadataResponse], error) {
+
+	var result ingestv1.BlockMetadataResponse
+
+	appendInRange := func(q TimeBounded, meta *block.Meta) {
+		if !InRange(q, model.Time(req.Msg.Start), model.Time(req.Msg.End)) {
+			return
+		}
+		var info typesv1.BlockInfo
+		meta.WriteBlockInfo(&info)
+		result.Blocks = append(result.Blocks, &info)
+	}
+
+	f.headLock.RLock()
+	for _, h := range f.heads {
+		appendInRange(h, h.meta)
+	}
+	for _, h := range f.flushing {
+		appendInRange(h, h.meta)
+	}
+	f.headLock.RUnlock()
+
+	f.blockQuerier.queriersLock.RLock()
+	for _, q := range f.blockQuerier.queriers {
+		appendInRange(q, q.meta)
+	}
+	f.blockQuerier.queriersLock.RUnlock()
+
+	// blocks move from heads to flushing to blockQuerier, so we need to check if that might have happened and caused a duplicate
+	result.Blocks = lo.UniqBy(result.Blocks, func(b *typesv1.BlockInfo) string {
+		return b.Ulid
+	})
+
+	return connect.NewResponse(&result), nil
+}
+
+func (f *PhlareDB) GetProfileStats(ctx context.Context, req *connect.Request[typesv1.GetProfileStatsRequest]) (*connect.Response[typesv1.GetProfileStatsResponse], error) {
+	sp, _ := opentracing.StartSpanFromContext(ctx, "PhlareDB GetProfileStats")
+	defer sp.Finish()
+
+	minTimes := make([]model.Time, 0)
+	maxTimes := make([]model.Time, 0)
+
+	f.headLock.RLock()
+	for _, h := range f.heads {
+		minT, maxT := h.Bounds()
+		minTimes = append(minTimes, minT)
+		maxTimes = append(maxTimes, maxT)
+	}
+	for _, h := range f.flushing {
+		minT, maxT := h.Bounds()
+		minTimes = append(minTimes, minT)
+		maxTimes = append(maxTimes, maxT)
+	}
+	f.headLock.RUnlock()
+
+	f.blockQuerier.queriersLock.RLock()
+	for _, q := range f.blockQuerier.queriers {
+		minT, maxT := q.Bounds()
+		minTimes = append(minTimes, minT)
+		maxTimes = append(maxTimes, maxT)
+	}
+	f.blockQuerier.queriersLock.RUnlock()
+
+	response, err := getProfileStatsFromBounds(minTimes, maxTimes)
+	return connect.NewResponse(response), err
+}
+
+func getProfileStatsFromBounds(minTimes, maxTimes []model.Time) (*typesv1.GetProfileStatsResponse, error) {
+	if len(minTimes) != len(maxTimes) {
+		return nil, errors.New("minTimes and maxTimes differ in length")
+	}
+	response := &typesv1.GetProfileStatsResponse{
+		DataIngested:      len(minTimes) > 0,
+		OldestProfileTime: math.MaxInt64,
+		NewestProfileTime: math.MinInt64,
+	}
+
+	for i, minTime := range minTimes {
+		maxTime := maxTimes[i]
+		if response.OldestProfileTime > minTime.Time().UnixMilli() {
+			response.OldestProfileTime = minTime.Time().UnixMilli()
+		}
+		if response.NewestProfileTime < maxTime.Time().UnixMilli() {
+			response.NewestProfileTime = maxTime.Time().UnixMilli()
+		}
+	}
+	return response, nil
 }

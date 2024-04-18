@@ -5,15 +5,14 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 
-	"github.com/google/pprof/profile"
 	"github.com/grafana/dskit/multierror"
 	"github.com/opentracing/opentracing-go"
+	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/prometheus/common/model"
 	"github.com/samber/lo"
 	"golang.org/x/sync/errgroup"
-
-	otlog "github.com/opentracing/opentracing-go/log"
 
 	googlev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
 	ingestv1 "github.com/grafana/pyroscope/api/gen/proto/go/ingester/v1"
@@ -40,11 +39,17 @@ type BidiClientMerge[Req any, Res any] interface {
 }
 
 type Request interface {
-	*ingestv1.MergeProfilesStacktracesRequest | *ingestv1.MergeProfilesLabelsRequest | *ingestv1.MergeProfilesPprofRequest
+	*ingestv1.MergeProfilesStacktracesRequest |
+		*ingestv1.MergeProfilesLabelsRequest |
+		*ingestv1.MergeProfilesPprofRequest |
+		*ingestv1.MergeSpanProfileRequest
 }
 
 type Response interface {
-	*ingestv1.MergeProfilesStacktracesResponse | *ingestv1.MergeProfilesLabelsResponse | *ingestv1.MergeProfilesPprofResponse
+	*ingestv1.MergeProfilesStacktracesResponse |
+		*ingestv1.MergeProfilesLabelsResponse |
+		*ingestv1.MergeProfilesPprofResponse |
+		*ingestv1.MergeSpanProfileResponse
 }
 
 type MergeResult[R any] interface {
@@ -59,6 +64,7 @@ type keepResponse struct {
 	*ingestv1.MergeProfilesStacktracesRequest
 	*ingestv1.MergeProfilesLabelsRequest
 	*ingestv1.MergeProfilesPprofRequest
+	*ingestv1.MergeSpanProfileRequest
 }
 type mergeIterator[R any, Req Request, Res Response] struct {
 	ctx  context.Context
@@ -95,6 +101,7 @@ func NewMergeIterator[
 			MergeProfilesStacktracesRequest: &ingestv1.MergeProfilesStacktracesRequest{},
 			MergeProfilesLabelsRequest:      &ingestv1.MergeProfilesLabelsRequest{},
 			MergeProfilesPprofRequest:       &ingestv1.MergeProfilesPprofRequest{},
+			MergeSpanProfileRequest:         &ingestv1.MergeSpanProfileRequest{},
 		},
 	}
 	it.fetchBatch()
@@ -118,6 +125,9 @@ func (s *mergeIterator[R, Req, Res]) Next() bool {
 			case BidiClientMerge[*ingestv1.MergeProfilesPprofRequest, *ingestv1.MergeProfilesPprofResponse]:
 				s.response.MergeProfilesPprofRequest.Profiles = s.keep
 				err = bidi.Send(s.response.MergeProfilesPprofRequest)
+			case BidiClientMerge[*ingestv1.MergeSpanProfileRequest, *ingestv1.MergeSpanProfileResponse]:
+				s.response.MergeSpanProfileRequest.Profiles = s.keep
+				err = bidi.Send(s.response.MergeSpanProfileRequest)
 			}
 			if err != nil {
 				s.err = err
@@ -163,6 +173,13 @@ func (s *mergeIterator[R, Req, Res]) fetchBatch() {
 			return
 		}
 		selectedProfiles = res.SelectedProfiles
+	case BidiClientMerge[*ingestv1.MergeSpanProfileRequest, *ingestv1.MergeSpanProfileResponse]:
+		res, err := bidi.Receive()
+		if err != nil {
+			s.err = err
+			return
+		}
+		selectedProfiles = res.SelectedProfiles
 	}
 	s.curr = selectedProfiles
 	if s.curr == nil {
@@ -199,6 +216,8 @@ func (s *mergeIterator[R, Req, Res]) Result() (R, error) {
 	case *ingestv1.MergeProfilesLabelsResponse:
 		return any(result.Series).(R), nil
 	case *ingestv1.MergeProfilesPprofResponse:
+		return any(result.Result).(R), nil
+	case *ingestv1.MergeSpanProfileResponse:
 		return any(result.Result).(R), nil
 	default:
 		return *new(R), fmt.Errorf("unexpected response type %T", result)
@@ -358,41 +377,43 @@ func selectMergePprofProfile(ctx context.Context, ty *typesv1.ProfileType, respo
 		return nil, err
 	}
 
+	span := opentracing.SpanFromContext(ctx)
 	// Collects the results in parallel.
-	results := make([]*profile.Profile, 0, len(iters))
-	s := lo.Synchronize()
+	var lock sync.Mutex
+	var pprofMerge pprof.ProfileMerge
 	g, _ := errgroup.WithContext(ctx)
 	for _, iter := range mergeResults {
 		iter := iter
 		g.Go(util.RecoverPanic(func() error {
+			start := time.Now()
 			result, err := iter.Result()
 			if err != nil || result == nil {
 				return err
 			}
-			p, err := profile.ParseUncompressed(result)
-			if err != nil {
+			if span != nil {
+				span.LogFields(
+					otlog.Int("profile_size", len(result)),
+					otlog.Int64("took_ms", time.Since(start).Milliseconds()),
+				)
+			}
+			var p googlev1.Profile
+			if err = pprof.Unmarshal(result, &p); err != nil {
 				return err
 			}
-			s.Do(func() {
-				results = append(results, p)
-			})
-			return nil
+			lock.Lock()
+			defer lock.Unlock()
+			return pprofMerge.Merge(&p)
 		}))
 	}
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
 
-	if len(results) == 0 {
-		empty := &profile.Profile{}
-		phlaremodel.SetProfileMetadata(empty, ty)
-		return pprof.FromProfile(empty)
+	p := pprofMerge.Profile()
+	if len(p.Sample) == 0 {
+		pprof.SetProfileMetadata(p, ty, 0, 0)
 	}
-	p, err := profile.Merge(results)
-	if err != nil {
-		return nil, err
-	}
-	return pprof.FromProfile(p)
+	return p, nil
 }
 
 type ProfileValue struct {
@@ -411,7 +432,7 @@ func (p ProfileValue) Timestamp() model.Time {
 }
 
 // selectMergeSeries selects the  profile from each ingester by deduping them and request merges of total values.
-func selectMergeSeries(ctx context.Context, responses []ResponseFromReplica[clientpool.BidiClientMergeProfilesLabels]) (iter.Iterator[ProfileValue], error) {
+func selectMergeSeries(ctx context.Context, aggregation *typesv1.TimeSeriesAggregationType, responses []ResponseFromReplica[clientpool.BidiClientMergeProfilesLabels]) (iter.Iterator[ProfileValue], error) {
 	mergeResults := make([]MergeResult[[]*typesv1.Series], len(responses))
 	iters := make([]MergeIterator, len(responses))
 	var wg sync.WaitGroup
@@ -454,13 +475,64 @@ func selectMergeSeries(ctx context.Context, responses []ResponseFromReplica[clie
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	series := phlaremodel.SumSeries(results...)
+	var series = phlaremodel.MergeSeries(aggregation, results...)
+
 	seriesIters := make([]iter.Iterator[ProfileValue], 0, len(series))
 	for _, s := range series {
 		s := s
 		seriesIters = append(seriesIters, newSeriesIterator(s.Labels, s.Points))
 	}
 	return iter.NewMergeIterator(ProfileValue{Ts: math.MaxInt64}, false, seriesIters...), nil
+}
+
+// selectMergeSpanProfile selects the  profile from each ingester by deduping them and
+// returns merge of stacktrace samples represented as a tree.
+func selectMergeSpanProfile(ctx context.Context, responses []ResponseFromReplica[clientpool.BidiClientMergeSpanProfile]) (*phlaremodel.Tree, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "selectMergeSpanProfile")
+	defer span.Finish()
+
+	mergeResults := make([]MergeResult[*ingestv1.MergeSpanProfileResult], len(responses))
+	iters := make([]MergeIterator, len(responses))
+	var wg sync.WaitGroup
+	for i, resp := range responses {
+		wg.Add(1)
+		go func(i int, resp ResponseFromReplica[clientpool.BidiClientMergeSpanProfile]) {
+			defer wg.Done()
+			it := NewMergeIterator[*ingestv1.MergeSpanProfileResult](
+				ctx, ResponseFromReplica[BidiClientMerge[*ingestv1.MergeSpanProfileRequest, *ingestv1.MergeSpanProfileResponse]]{
+					addr:     resp.addr,
+					response: resp.response,
+				})
+			iters[i] = it
+			mergeResults[i] = it
+		}(i, resp)
+	}
+	wg.Wait()
+
+	if err := skipDuplicates(ctx, iters); err != nil {
+		return nil, err
+	}
+
+	// Collects the results in parallel.
+	span.LogFields(otlog.String("msg", "collecting merge results"))
+	g, _ := errgroup.WithContext(ctx)
+	m := phlaremodel.NewTreeMerger()
+	for _, iter := range mergeResults {
+		iter := iter
+		g.Go(util.RecoverPanic(func() error {
+			result, err := iter.Result()
+			if err != nil || result == nil {
+				return err
+			}
+			return m.MergeTreeBytes(result.TreeBytes)
+		}))
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	span.LogFields(otlog.String("msg", "building tree"))
+	return m.Tree(), nil
 }
 
 type seriesIterator struct {

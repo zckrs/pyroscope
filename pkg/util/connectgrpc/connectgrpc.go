@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/grafana/pyroscope/pkg/tenant"
@@ -52,7 +52,7 @@ type GRPCHandler interface {
 }
 
 func RoundTripUnary[Req any, Res any](ctx context.Context, rt GRPCRoundTripper, in *connect.Request[Req]) (*connect.Response[Res], error) {
-	req, err := encodeRequest(in)
+	req, err := encodeRequest(ctx, in)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +61,13 @@ func RoundTripUnary[Req any, Res any](ctx context.Context, rt GRPCRoundTripper, 
 		return nil, err
 	}
 	if res.Code/100 != 2 {
-		return nil, connect.NewError(HTTPToCode(res.Code), errors.New(string(res.Body)))
+		err := connect.NewError(HTTPToCode(res.Code), errors.New(string(res.Body)))
+		for _, h := range res.Headers {
+			for _, v := range h.Values {
+				err.Meta().Add(h.Key, v)
+			}
+		}
+		return nil, err
 	}
 	return decodeResponse[Res](res)
 }
@@ -115,9 +121,23 @@ func decodeRequest[Req any](req *httpgrpc.HTTPRequest) (*connect.Request[Req], e
 	return result, nil
 }
 
-func encodeRequest[Req any](req *connect.Request[Req]) (*httpgrpc.HTTPRequest, error) {
-	if req.Spec().Procedure == "" {
-		return nil, errors.New("cannot encode a request with empty procedure")
+type connectURLCtxKey struct{}
+
+func WithProcedure(ctx context.Context, u string) context.Context {
+	return context.WithValue(ctx, connectURLCtxKey{}, u)
+}
+
+func ProcedureFromContext(ctx context.Context) string {
+	s, _ := ctx.Value(connectURLCtxKey{}).(string)
+	return s
+}
+
+func encodeRequest[Req any](ctx context.Context, req *connect.Request[Req]) (*httpgrpc.HTTPRequest, error) {
+	url := ProcedureFromContext(ctx)
+	if url == "" {
+		if url = req.Spec().Procedure; url == "" {
+			return nil, errors.New("cannot encode a request with empty procedure")
+		}
 	}
 	// The original Content-* headers could be invalidated,
 	// e.g. initial Content-Type could be 'application/json'.
@@ -125,7 +145,7 @@ func encodeRequest[Req any](req *connect.Request[Req]) (*httpgrpc.HTTPRequest, e
 	h.Set("Content-Type", "application/proto")
 	out := &httpgrpc.HTTPRequest{
 		Method:  http.MethodPost,
-		Url:     req.Spec().Procedure,
+		Url:     url,
 		Headers: connectHeaderToHTTPGRPCHeader(h),
 	}
 	var err error
@@ -151,6 +171,11 @@ func decodeResponse[Resp any](r *httpgrpc.HTTPResponse) (*connect.Response[Resp]
 		return nil, err
 	}
 	resp := &connect.Response[Resp]{Msg: new(Resp)}
+	for _, h := range r.Headers {
+		for _, v := range h.Values {
+			resp.Header().Add(h.Key, v)
+		}
+	}
 	if err := proto.Unmarshal(r.Body, resp.Any().(proto.Message)); err != nil {
 		return nil, err
 	}
@@ -339,5 +364,4 @@ func (g *httpgrpcClient) Do(req *http.Request) (*http.Response, error) {
 		StatusCode:    int(resp.Code),
 		Header:        httpgrpcHeaderToConnectHeader(resp.Headers),
 	}, nil
-
 }

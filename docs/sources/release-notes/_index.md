@@ -1,12 +1,14 @@
 ---
-title: "Grafana Phlare release notes"
-menuTitle: "Release notes"
-description: "Release notes for all versions of Grafana Phlare."
-weight: 10
-keywords:
-  - Grafana Phlare release notes
+title: Release notes
+description: Release notes for Grafana Pyroscope
+weight: 2
 ---
 
-# Grafana Phlare release notes
+# Release notes
 
-{{< section menuTitle="true" >}}
+Release notes for Grafana Pyroscope are in the CHANGELOG for the release and
+listed here by version number.
+
+Packages are linked in the [Assets section for each Pyroscope release](https://github.com/grafana/pyroscope/releases).
+
+{{< section >}}

@@ -21,6 +21,11 @@ var cfg struct {
 	blocks  struct {
 		path               string
 		restoreMissingMeta bool
+		compact            struct {
+			src    string
+			dst    string
+			shards int
+		}
 	}
 }
 
@@ -33,31 +38,51 @@ func main() {
 	ctx := phlarecontext.WithLogger(context.Background(), logger)
 	ctx = withOutput(ctx, os.Stdout)
 
-	app := kingpin.New(filepath.Base(os.Args[0]), "Tooling for Grafana Phlare, the continuous profiling aggregation system.").UsageWriter(os.Stdout)
-	app.Version(version.Print("phlaretool"))
+	app := kingpin.New(filepath.Base(os.Args[0]), "Tooling for Grafana Pyroscope, the continuous profiling aggregation system.").UsageWriter(os.Stdout)
+	app.Version(version.Print("profilecli"))
 	app.HelpFlag.Short('h')
 	app.Flag("verbose", "Enable verbose logging.").Short('v').Default("0").BoolVar(&cfg.verbose)
 
-	blocksCmd := app.Command("blocks", "Operate on Grafana Phlare's blocks.")
+	adminCmd := app.Command("admin", "Administrative tasks for Pyroscope cluster operators.")
+
+	blocksCmd := adminCmd.Command("blocks", "Operate on Grafana Pyroscope's blocks.")
 	blocksCmd.Flag("path", "Path to blocks directory").Default("./data/local").StringVar(&cfg.blocks.path)
 
 	blocksListCmd := blocksCmd.Command("list", "List blocks.")
 	blocksListCmd.Flag("restore-missing-meta", "").Default("false").BoolVar(&cfg.blocks.restoreMissingMeta)
 
-	parquetCmd := app.Command("parquet", "Operate on a Parquet file.")
+	blocksCompactCmd := blocksCmd.Command("compact", "Compact blocks.")
+	blocksCompactCmd.Arg("from", "The source input blocks to compact.").Required().ExistingDirVar(&cfg.blocks.compact.src)
+	blocksCompactCmd.Arg("dest", "The destination where compacted blocks should be stored.").Required().StringVar(&cfg.blocks.compact.dst)
+	blocksCompactCmd.Flag("shards", "The amount of shards to split output blocks into.").Default("0").IntVar(&cfg.blocks.compact.shards)
+
+	parquetCmd := adminCmd.Command("parquet", "Operate on a Parquet file.")
 	parquetInspectCmd := parquetCmd.Command("inspect", "Inspect a parquet file's structure.")
 	parquetInspectFiles := parquetInspectCmd.Arg("file", "parquet file path").Required().ExistingFiles()
 
+	tsdbCmd := adminCmd.Command("tsdb", "Operate on a TSDB index file.")
+	tsdbSeriesCmd := tsdbCmd.Command("series", "dump series in an TSDB index file.")
+	tsdbSeriesFiles := tsdbSeriesCmd.Arg("file", "tsdb file path").Required().ExistingFiles()
+
 	queryCmd := app.Command("query", "Query profile store.")
-	queryParams := addQueryParams(queryCmd)
-	queryOutput := queryCmd.Flag("output", "How to output the result, examples: console, raw, pprof=./my.pprof").Default("console").String()
 	queryMergeCmd := queryCmd.Command("merge", "Request merged profile.")
+	queryMergeOutput := queryMergeCmd.Flag("output", "How to output the result, examples: console, raw, pprof=./my.pprof").Default("console").String()
+	queryMergeParams := addQueryMergeParams(queryMergeCmd)
+	querySeriesCmd := queryCmd.Command("series", "Request series labels.")
+	querySeriesParams := addQuerySeriesParams(querySeriesCmd)
+
+	queryTracerCmd := app.Command("query-tracer", "Analyze query traces.")
+	queryTracerParams := addQueryTracerParams(queryTracerCmd)
 
 	uploadCmd := app.Command("upload", "Upload profile(s).")
 	uploadParams := addUploadParams(uploadCmd)
 
 	canaryExporterCmd := app.Command("canary-exporter", "Run the canary exporter.")
 	canaryExporterParams := addCanaryExporterParams(canaryExporterCmd)
+
+	bucketCmd := adminCmd.Command("bucket", "Run the bucket visualization tool.")
+	bucketWebCmd := bucketCmd.Command("web", "Run the web tool for visualizing blocks in object-store buckets.")
+	bucketWebParams := addBucketWebToolParams(bucketWebCmd)
 
 	// parse command line arguments
 	parsedCmd := kingpin.MustParse(app.Parse(os.Args[1:]))
@@ -76,10 +101,26 @@ func main() {
 				os.Exit(checkError(err))
 			}
 		}
+	case tsdbSeriesCmd.FullCommand():
+		for _, file := range *tsdbSeriesFiles {
+			if err := tsdbSeries(ctx, file); err != nil {
+				os.Exit(checkError(err))
+			}
+		}
 	case queryMergeCmd.FullCommand():
-		if err := queryMerge(ctx, queryParams, *queryOutput); err != nil {
+		if err := queryMerge(ctx, queryMergeParams, *queryMergeOutput); err != nil {
 			os.Exit(checkError(err))
 		}
+	case querySeriesCmd.FullCommand():
+		if err := querySeries(ctx, querySeriesParams); err != nil {
+			os.Exit(checkError(err))
+		}
+
+	case queryTracerCmd.FullCommand():
+		if err := queryTracer(ctx, queryTracerParams); err != nil {
+			os.Exit(checkError(err))
+		}
+
 	case uploadCmd.FullCommand():
 		if err := upload(ctx, uploadParams); err != nil {
 			os.Exit(checkError(err))
@@ -88,10 +129,17 @@ func main() {
 		if err := newCanaryExporter(canaryExporterParams).run(ctx); err != nil {
 			os.Exit(checkError(err))
 		}
+	case bucketWebCmd.FullCommand():
+		if err := newBucketWebTool(bucketWebParams).run(ctx); err != nil {
+			os.Exit(checkError(err))
+		}
+	case blocksCompactCmd.FullCommand():
+		if err := blocksCompact(ctx, cfg.blocks.compact.src, cfg.blocks.compact.dst, cfg.blocks.compact.shards); err != nil {
+			os.Exit(checkError(err))
+		}
 	default:
 		level.Error(logger).Log("msg", "unknown command", "cmd", parsedCmd)
 	}
-
 }
 
 func checkError(err error) int {

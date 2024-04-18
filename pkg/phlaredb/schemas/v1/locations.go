@@ -1,7 +1,7 @@
 package v1
 
 import (
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 
 	profilev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
 )
@@ -108,6 +108,13 @@ type InMemoryLocation struct {
 	//	line[0].function_name == "memcpy"
 	//	line[1].function_name == "printf"
 	Line []InMemoryLine
+}
+
+func (l *InMemoryLocation) Clone() *InMemoryLocation {
+	x := *l
+	x.Line = make([]InMemoryLine, len(l.Line))
+	copy(x.Line, l.Line)
+	return &x
 }
 
 type InMemoryLine struct {

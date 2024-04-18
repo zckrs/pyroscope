@@ -3,7 +3,7 @@ name: "publish-technical-documentation-release"
 on:
   push:
     branches:
-    - "release/v[0-9]+.[0-9]+.[0-9]+"
+    - "release/v[0-9]+.[0-9]+"
     tags:
     - "v[0-9]+.[0-9]+.[0-9]+"
     paths:
@@ -24,7 +24,7 @@ jobs:
     needs: "test"
     steps:
 
-    - name: "Checkout Phlare repo"
+    - name: "Checkout Pyroscope repo"
       uses: "actions/checkout@v3"
       with:
         fetch-depth: 0
@@ -77,4 +77,4 @@ jobs:
         github_pat: "grafanabot:${{ secrets.PUBLISH_TO_WEBSITE_TOKEN }}"
         source_folder: "docs/sources"
         # Append ".x" to target to produce a v<major>.<minor>.x directory.
-        target_folder: "content/docs/phlare/${{ steps.target.outputs.target }}.x"
+        target_folder: "content/docs/pyroscope/${{ steps.target.outputs.target }}.x"

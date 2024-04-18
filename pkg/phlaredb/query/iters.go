@@ -12,7 +12,7 @@ import (
 	"github.com/grafana/dskit/multierror"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/log"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 
 	"github.com/grafana/pyroscope/pkg/iter"
 )
@@ -387,6 +387,15 @@ func (r *IteratorResult) Columns(buffer [][]parquet.Value, names ...string) [][]
 	return buffer
 }
 
+func (r *IteratorResult) ColumnValue(name string) parquet.Value {
+	for _, e := range r.Entries {
+		if e.k == name {
+			return e.V
+		}
+	}
+	return parquet.Value{}
+}
+
 // iterator - Every iterator follows this interface and can be composed.
 type Iterator = iter.SeekIterator[*IteratorResult, RowNumberWithDefinitionLevel]
 
@@ -432,6 +441,7 @@ func NewBinaryJoinIterator(definitionLevel int, left, right Iterator) *BinaryJoi
 		left:            left,
 		right:           right,
 		definitionLevel: definitionLevel,
+		res:             iteratorResultPoolGet(),
 	}
 }
 
@@ -447,7 +457,7 @@ func (bj *BinaryJoinIterator) nextOrSeek(to RowNumberWithDefinitionLevel, it Ite
 }
 
 func (bj *BinaryJoinIterator) makeResult() {
-	bj.res = iteratorResultPoolGet()
+	bj.res.Reset()
 	bj.res.RowNumber = EmptyRowNumber()
 	bj.res.RowNumber[0] = bj.left.At().RowNumber[0]
 	bj.res.Append(bj.left.At())
@@ -455,8 +465,12 @@ func (bj *BinaryJoinIterator) makeResult() {
 }
 
 func (bj *BinaryJoinIterator) Next() bool {
+	var r *IteratorResult
 	for {
-		iteratorResultPoolPut(bj.left.At())
+		if r != nil {
+			iteratorResultPoolPut(r)
+		}
+		r = bj.left.At()
 		if !bj.left.Next() {
 			bj.err = bj.left.Err()
 			return false
@@ -873,7 +887,6 @@ func syncIteratorPoolPut(b []parquet.Value) {
 }
 
 func NewSyncIterator(ctx context.Context, rgs []parquet.RowGroup, column int, columnName string, readSize int, filter Predicate, selectAs string) *SyncIterator {
-
 	// Assign row group bounds.
 	// Lower bound is inclusive
 	// Upper bound is exclusive, points at the first row of the next group
@@ -935,7 +948,6 @@ func (c *SyncIterator) Next() bool {
 // SeekTo moves this iterator to the next result that is greater than
 // or equal to the given row number (and based on the given definition level)
 func (c *SyncIterator) Seek(to RowNumberWithDefinitionLevel) bool {
-
 	if c.seekRowGroup(to.RowNumber, to.DefinitionLevel) {
 		c.res = nil
 		c.err = nil
@@ -1033,7 +1045,6 @@ func (c *SyncIterator) seekPages(seekTo RowNumber, definitionLevel int) (done bo
 	}
 
 	if c.currPage == nil {
-
 		// TODO (mdisibio)   :((((((((
 		//    pages.SeekToRow is more costly than expected.  It doesn't reuse existing i/o
 		// so it can't be called naively every time we swap pages. We need to figure out
@@ -1196,7 +1207,6 @@ func (c *SyncIterator) setRowGroup(rg parquet.RowGroup, min, max RowNumber) {
 }
 
 func (c *SyncIterator) setPage(pg parquet.Page) {
-
 	// Handle an outgoing page
 	if c.currPage != nil {
 		c.curr = c.currPageMax.Preceding() // Reposition current row number to end of this page.

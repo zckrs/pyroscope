@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"sync"
-	"unsafe"
 
 	"github.com/gogo/status"
 	"github.com/opentracing/opentracing-go"
@@ -182,12 +181,27 @@ func (pi *profilesIndex) Add(ps *schemav1.InMemoryProfile, lbs phlaremodel.Label
 		pi.metrics.seriesCreated.WithLabelValues(profileName).Inc()
 	}
 
-	profiles.profiles = append(profiles.profiles, ps)
+	// profile is latest in this series, use a shortcut
+	if ps.TimeNanos > profiles.maxTime {
+		// update max timeNanos
+		profiles.maxTime = ps.TimeNanos
+
+		// add profile to in memory slice
+		profiles.profiles = append(profiles.profiles, ps)
+	} else {
+		// use binary search to find position
+		i := sort.Search(len(profiles.profiles), func(i int) bool {
+			return profiles.profiles[i].TimeNanos > ps.TimeNanos
+		})
+
+		// insert into slice at correct position
+		profiles.profiles = append(profiles.profiles, &schemav1.InMemoryProfile{})
+		copy(profiles.profiles[i+1:], profiles.profiles[i:])
+		profiles.profiles[i] = ps
+	}
+
 	if ps.TimeNanos < profiles.minTime {
 		profiles.minTime = ps.TimeNanos
-	}
-	if ps.TimeNanos > profiles.maxTime {
-		profiles.maxTime = ps.TimeNanos
 	}
 
 	pi.metrics.profiles.Set(float64(pi.totalProfiles.Inc()))
@@ -292,6 +306,8 @@ type ProfileWithLabels struct {
 	lbs     phlaremodel.Labels
 	fp      model.Fingerprint
 }
+
+func (p ProfileWithLabels) RowNumber() int64 { return 0 }
 
 func (p ProfileWithLabels) StacktracePartition() uint64 {
 	return p.profile.StacktracePartition
@@ -446,6 +462,9 @@ func (pi *profilesIndex) writeTo(ctx context.Context, path string) ([][]rowRange
 }
 
 func (pi *profilesIndex) cutRowGroup(rgProfiles []schemav1.InMemoryProfile) error {
+	pi.mutex.Lock()
+	defer pi.mutex.Unlock()
+
 	// adding rowGroup and rowNum information per fingerprint
 	rowRangePerFP := make(map[model.Fingerprint]*rowRange, len(pi.profilesPerFP))
 	countPerFP := make(map[model.Fingerprint]int, len(pi.profilesPerFP))
@@ -465,9 +484,6 @@ func (pi *profilesIndex) cutRowGroup(rgProfiles []schemav1.InMemoryProfile) erro
 			return fmt.Errorf("rowRange is not matching up, ensure that the ordering of the profile row group is ordered correctly, current row_num=%d, expect range %d-%d", rowNum, rowRange.rowNum, int(rowRange.rowNum)+rowRange.length)
 		}
 	}
-
-	pi.mutex.Lock()
-	defer pi.mutex.Unlock()
 
 	pi.rowGroupsOnDisk += 1
 
@@ -509,51 +525,4 @@ func SplitFiltersAndMatchers(allMatchers []*labels.Matcher) (filters, matchers [
 		}
 	}
 	return
-}
-
-// nolint unused
-const (
-	profileSize = uint64(unsafe.Sizeof(schemav1.InMemoryProfile{}))
-)
-
-type profilesHelper struct{}
-
-// nolint unused
-func (*profilesHelper) addToRewriter(r *rewriter, elemRewriter idConversionTable) {
-	r.locations = elemRewriter
-}
-
-// nolint unused
-func (*profilesHelper) rewrite(r *rewriter, s *schemav1.InMemoryProfile) error {
-	for pos := range s.Comments {
-		r.strings.rewrite(&s.Comments[pos])
-	}
-
-	r.strings.rewrite(&s.DropFrames)
-	r.strings.rewrite(&s.KeepFrames)
-
-	return nil
-}
-
-// nolint unused
-func (*profilesHelper) setID(oldID, newID uint64, p *schemav1.InMemoryProfile) uint64 {
-	return oldID
-}
-
-// nolint unused
-func (*profilesHelper) size(p *schemav1.InMemoryProfile) uint64 {
-	size := profileSize
-
-	size += 8
-	size += uint64(len(p.Comments) * 8)
-
-	// 4 bytes for stacktrace id and 8 bytes for each stacktrace value
-	size += uint64(len(p.Samples.StacktraceIDs) * (4 + 8))
-
-	return size
-}
-
-// nolint unused
-func (*profilesHelper) clone(p *schemav1.InMemoryProfile) *schemav1.InMemoryProfile {
-	return p
 }

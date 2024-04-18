@@ -2,16 +2,17 @@
 aliases:
   - /docs/phlare/latest/operators-guide/configuring/
   - /docs/phlare/latest/operators-guide/configure/
-description: This section provides links to Grafana Phlare server configuration topics.
+  - /docs/phlare/latest/configure-server/
+description: This section provides links to Pyroscope server configuration topics.
 keywords:
-  - Phlare server configuration
-menuTitle: Configure the Server
-title: Configure Grafana Phlare Server
+  - Pyroscope server configuration
+menuTitle: Configure the server
+title: Configure the Pyroscope server
 weight: 40
 ---
 
-# Configure Grafana Phlare Server
+# Configure the Pyroscope server
 
-Grafana Phlare's server is built to be horizontally scalable and to support organizations of all sizes.
+The Pyroscope server is built to be horizontally scalable and to support organizations of all sizes.
 
 {{< section menuTitle="true" >}}

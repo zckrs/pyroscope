@@ -21,7 +21,7 @@ func (g *GoTable) IsDead() bool {
 
 func (g *GoTable) DebugInfo() SymTabDebugInfo {
 	return SymTabDebugInfo{
-		Name: "GoTable",
+		Name: fmt.Sprintf("GoTable %p", g),
 		Size: len(g.Index.Name),
 		File: g.File.fpath,
 	}
@@ -135,7 +135,7 @@ func (g *GoTable) goSymbolName(idx int) (string, error) {
 	}
 
 	offsetName := g.Index.Name[idx]
-	name, ok := g.File.getString(int(offsetGpcln) + int(g.funcNameOffset) + int(offsetName))
+	name, ok := g.File.getString(int(offsetGpcln)+int(g.funcNameOffset)+int(offsetName), nil)
 	if !ok {
 		return "", errGoFailed
 	}
@@ -153,7 +153,7 @@ func (g *GoTableWithFallback) IsDead() bool {
 
 func (g *GoTableWithFallback) DebugInfo() SymTabDebugInfo {
 	return SymTabDebugInfo{
-		Name: "GoTableWithFallback",
+		Name: fmt.Sprintf("GoTableWithFallback %p ", g),
 		Size: g.GoTable.Size() + g.SymTable.Size(),
 		File: g.GoTable.File.fpath,
 	}

@@ -13,8 +13,8 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/runutil"
+	"github.com/parquet-go/parquet-go"
 	"github.com/pkg/errors"
-	"github.com/segmentio/parquet-go"
 	"go.uber.org/atomic"
 
 	phlaremodel "github.com/grafana/pyroscope/pkg/model"
@@ -24,6 +24,10 @@ import (
 	"github.com/grafana/pyroscope/pkg/phlaredb/query"
 	schemav1 "github.com/grafana/pyroscope/pkg/phlaredb/schemas/v1"
 	"github.com/grafana/pyroscope/pkg/util/build"
+)
+
+const (
+	parquetWriteBufferSize = 3 << 20 // 3MB
 )
 
 type profileStore struct {
@@ -36,7 +40,6 @@ type profileStore struct {
 
 	path      string
 	persister schemav1.Persister[*schemav1.Profile]
-	helper    storeHelper[*schemav1.InMemoryProfile]
 	writer    *parquet.GenericWriter[*schemav1.Profile]
 
 	// lock serializes appends to the slice. Every new profile is appended
@@ -61,6 +64,16 @@ type profileStore struct {
 	flushWg        sync.WaitGroup
 	flushBuffer    []schemav1.InMemoryProfile
 	flushBufferLbs []phlaremodel.Labels
+	onFlush        func()
+}
+
+func newParquetProfileWriter(writer io.Writer, options ...parquet.WriterOption) *parquet.GenericWriter[*schemav1.Profile] {
+	options = append(options, parquet.PageBufferSize(parquetWriteBufferSize))
+	options = append(options, parquet.CreatedBy("github.com/grafana/pyroscope/", build.Version, build.Revision))
+	options = append(options, schemav1.ProfilesSchema)
+	return parquet.NewGenericWriter[*schemav1.Profile](
+		writer, options...,
+	)
 }
 
 func newProfileStore(phlarectx context.Context) *profileStore {
@@ -68,7 +81,6 @@ func newProfileStore(phlarectx context.Context) *profileStore {
 		logger:     phlarecontext.Logger(phlarectx),
 		metrics:    contextHeadMetrics(phlarectx),
 		persister:  &schemav1.ProfilePersister{},
-		helper:     &profilesHelper{},
 		flushing:   atomic.NewBool(false),
 		flushQueue: make(chan int),
 	}
@@ -76,11 +88,7 @@ func newProfileStore(phlarectx context.Context) *profileStore {
 	go s.cutRowGroupLoop()
 	// Initialize writer on /dev/null
 	// TODO: Reuse parquet.Writer beyond life time of the head.
-	s.writer = parquet.NewGenericWriter[*schemav1.Profile](io.Discard, s.persister.Schema(),
-		parquet.ColumnPageBuffers(parquet.NewFileBufferPool(os.TempDir(), "phlaredb-parquet-buffers*")),
-		parquet.CreatedBy("github.com/grafana/pyroscope/", build.Version, build.Revision),
-		parquet.PageBufferSize(3*1024*1024),
-	)
+	s.writer = newParquetProfileWriter(io.Discard)
 
 	return s
 }
@@ -236,7 +244,11 @@ func (s *profileStore) cutRowGroup(count int) (err error) {
 		s.path,
 		fmt.Sprintf("%s.%d%s", s.persister.Name(), s.rowsFlushed, block.ParquetSuffix),
 	)
-
+	// Removes the file if it exists. This can happen if the previous
+	// cut attempt failed.
+	if err := os.Remove(path); err == nil {
+		level.Warn(s.logger).Log("msg", "deleting row group segment of a failed previous attempt", "path", path)
+	}
 	f, err := s.prepareFile(path)
 	if err != nil {
 		return err
@@ -353,7 +365,7 @@ func (s *profileStore) loadProfilesToFlush(count int) uint64 {
 	sort.Sort(byLabels{p: s.flushBuffer, lbs: s.flushBufferLbs})
 	var size uint64
 	for _, p := range s.flushBuffer {
-		size += s.helper.size(&p)
+		size += p.Size()
 	}
 	return size
 }
@@ -379,14 +391,7 @@ func (s *profileStore) writeRowGroups(path string, rowGroups []parquet.RowGroup)
 	return n, numRowGroups, nil
 }
 
-func (s *profileStore) ingest(_ context.Context, profiles []schemav1.InMemoryProfile, lbs phlaremodel.Labels, profileName string, rewriter *rewriter) error {
-	// rewrite elements
-	for pos := range profiles {
-		if err := s.helper.rewrite(rewriter, &profiles[pos]); err != nil {
-			return err
-		}
-	}
-
+func (s *profileStore) ingest(_ context.Context, profiles []schemav1.InMemoryProfile, lbs phlaremodel.Labels, profileName string) error {
 	s.profilesLock.Lock()
 	defer s.profilesLock.Unlock()
 
@@ -404,7 +409,7 @@ func (s *profileStore) ingest(_ context.Context, profiles []schemav1.InMemoryPro
 		s.index.Add(&p, lbs, profileName)
 
 		// increase size of stored data
-		addedBytes := s.helper.size(&profiles[pos])
+		addedBytes := profiles[pos].Size()
 		s.metrics.sizeBytes.WithLabelValues(s.Name()).Set(float64(s.size.Add(addedBytes)))
 		s.totalSize.Add(addedBytes)
 
@@ -424,6 +429,9 @@ func (s *profileStore) cutRowGroupLoop() {
 			level.Error(s.logger).Log("msg", "cutting row group", "err", err)
 		}
 		s.flushing.Store(false)
+		if s.onFlush != nil {
+			s.onFlush()
+		}
 	}
 }
 
@@ -539,4 +547,10 @@ func (r *seriesIDRowsRewriter) ReadRows(rows []parquet.Row) (int, error) {
 	r.pos += int64(n)
 
 	return n, nil
+}
+
+func copySlice[T any](in []T) []T {
+	out := make([]T, len(in))
+	copy(out, in)
+	return out
 }

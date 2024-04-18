@@ -7,37 +7,49 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"github.com/go-kit/log/level"
+
+	"github.com/grafana/pyroscope/pkg/distributor/model"
+	"github.com/grafana/pyroscope/pkg/tenant"
+
+	"connectrpc.com/connect"
 	"github.com/go-kit/log"
 	"github.com/google/uuid"
-	"github.com/grafana/pyroscope/pkg/og/ingestion"
-	"github.com/grafana/pyroscope/pkg/og/storage"
-	"github.com/grafana/pyroscope/pkg/og/storage/tree"
 	"github.com/prometheus/prometheus/model/labels"
 	"google.golang.org/protobuf/proto"
 
 	pushv1 "github.com/grafana/pyroscope/api/gen/proto/go/push/v1"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
 	phlaremodel "github.com/grafana/pyroscope/pkg/model"
+	"github.com/grafana/pyroscope/pkg/og/ingestion"
+	"github.com/grafana/pyroscope/pkg/og/storage"
+	"github.com/grafana/pyroscope/pkg/og/storage/tree"
 )
 
 type PushService interface {
 	Push(ctx context.Context, req *connect.Request[pushv1.PushRequest]) (*connect.Response[pushv1.PushResponse], error)
+	PushParsed(ctx context.Context, req *model.PushRequest) (*connect.Response[pushv1.PushResponse], error)
 }
 
 func NewPyroscopeIngestHandler(svc PushService, logger log.Logger) http.Handler {
 	return NewIngestHandler(
 		logger,
-		&pyroscopeIngesterAdapter{svc: svc},
+		&pyroscopeIngesterAdapter{svc: svc, log: logger},
 	)
 }
 
 type pyroscopeIngesterAdapter struct {
 	svc PushService
+	log log.Logger
 }
 
 func (p *pyroscopeIngesterAdapter) Ingest(ctx context.Context, in *ingestion.IngestInput) error {
-	return in.Profile.Parse(ctx, p, p, in.Metadata)
+	pprofable, ok := in.Profile.(ingestion.ParseableToPprof)
+	if ok {
+		return p.parseToPprof(ctx, in, pprofable)
+	} else {
+		return in.Profile.Parse(ctx, p, p, in.Metadata)
+	}
 }
 
 const (
@@ -106,13 +118,13 @@ func (p *pyroscopeIngesterAdapter) Put(ctx context.Context, pi *storage.PutInput
 	})
 	if pi.SpyName != "" {
 		series.Labels = append(series.Labels, &typesv1.LabelPair{
-			Name:  "pyroscope_spy",
+			Name:  phlaremodel.LabelNamePyroscopeSpy,
 			Value: pi.SpyName,
 		})
 	}
 	hasServiceName := false
 	for k, v := range pi.Key.Labels() {
-		if strings.HasPrefix(k, "__") {
+		if !phlaremodel.IsLabelAllowedForIngestion(k) {
 			continue
 		}
 		if k == "service_name" {
@@ -149,6 +161,25 @@ func (p *pyroscopeIngesterAdapter) Put(ctx context.Context, pi *storage.PutInput
 
 func (p *pyroscopeIngesterAdapter) Evaluate(input *storage.PutInput) (storage.SampleObserver, bool) {
 	return nil, false // noop
+}
+
+func (p *pyroscopeIngesterAdapter) parseToPprof(ctx context.Context, in *ingestion.IngestInput, pprofable ingestion.ParseableToPprof) error {
+	plainReq, err := pprofable.ParseToPprof(ctx, in.Metadata)
+	if err != nil {
+		return fmt.Errorf("parsing IngestInput-pprof failed %w", err)
+	}
+	if len(plainReq.Series) == 0 {
+		tenantID, _ := tenant.ExtractTenantIDFromContext(ctx)
+		_ = level.Debug(p.log).Log("msg", "empty profile",
+			"application", in.Metadata.Key.AppName(),
+			"orgID", tenantID)
+		return nil
+	}
+	_, err = p.svc.PushParsed(ctx, plainReq)
+	if err != nil {
+		return fmt.Errorf("pushing IngestInput-pprof failed %w", err)
+	}
+	return nil
 }
 
 func convertMetadata(pi *storage.PutInput) (metricName, stType, stUnit, app string, err error) {

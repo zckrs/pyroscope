@@ -46,7 +46,7 @@ const (
 	ProfileFileTypePerfScript ProfileFileType = "perf_script"
 )
 
-type ConverterFn func(b []byte, name string, maxNodes int) (*flamebearer.FlamebearerProfile, error)
+type ConverterFn func(b []byte, name string, maxNodes int) ([]*flamebearer.FlamebearerProfile, error)
 
 var formatConverters = map[ProfileFileType]ConverterFn{
 	ProfileFileTypeJSON:       JSONToProfile,
@@ -55,7 +55,7 @@ var formatConverters = map[ProfileFileType]ConverterFn{
 	ProfileFileTypePerfScript: PerfScriptToProfile,
 }
 
-func FlamebearerFromFile(f ProfileFile, maxNodes int) (*flamebearer.FlamebearerProfile, error) {
+func FlamebearerFromFile(f ProfileFile, maxNodes int) ([]*flamebearer.FlamebearerProfile, error) {
 	convertFn, _, err := Converter(f)
 	if err != nil {
 		return nil, err
@@ -70,21 +70,27 @@ func Converter(p ProfileFile) (ConverterFn, ProfileFileType, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	return func(b []byte, name string, maxNodes int) (*flamebearer.FlamebearerProfile, error) {
-		fb, err := convertFn(b, name, maxNodes)
+	return func(b []byte, name string, maxNodes int) ([]*flamebearer.FlamebearerProfile, error) {
+		fbs, err := convertFn(b, name, maxNodes)
 		if err != nil {
 			return nil, fmt.Errorf("unable to process the profile. The profile was detected as %q: %w",
 				converterToFormat(convertFn), err)
 		}
 		// Overwrite fields if available
 		if p.TypeData.SpyName != "" {
-			fb.Metadata.SpyName = p.TypeData.SpyName
+			for _, fb := range fbs {
+				fb.Metadata.SpyName = p.TypeData.SpyName
+			}
 		}
 		// Replace the units if provided
 		if p.TypeData.Units != "" {
-			fb.Metadata.Units = p.TypeData.Units
+			for _, fb := range fbs {
+				if fb.Metadata.Units == "" {
+					fb.Metadata.Units = p.TypeData.Units
+				}
+			}
 		}
-		return fb, nil
+		return fbs, nil
 	}, converterToFormat(convertFn), nil
 }
 
@@ -151,16 +157,13 @@ func converter(p ProfileFile) (ConverterFn, error) {
 	return CollapsedToProfile, nil
 }
 
-func JSONToProfile(b []byte, name string, maxNodes int) (*flamebearer.FlamebearerProfile, error) {
+func JSONToProfile(b []byte, name string, maxNodes int) ([]*flamebearer.FlamebearerProfile, error) {
 	var profile flamebearer.FlamebearerProfile
 	if err := json.Unmarshal(b, &profile); err != nil {
 		return nil, fmt.Errorf("unable to unmarshall JSON: %w", err)
 	}
 	if err := profile.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid profile: %w", err)
-	}
-	if name != "" {
-		profile.Metadata.Name = name
 	}
 
 	t, err := flamebearer.ProfileToTree(profile)
@@ -180,15 +183,15 @@ func JSONToProfile(b []byte, name string, maxNodes int) (*flamebearer.Flamebeare
 	}
 
 	p := flamebearer.NewProfile(pc)
-	return &p, nil
+	return []*flamebearer.FlamebearerProfile{&p}, nil
 }
 
-func PprofToProfile(b []byte, name string, maxNodes int) (*flamebearer.FlamebearerProfile, error) {
+func PprofToProfile(b []byte, name string, maxNodes int) ([]*flamebearer.FlamebearerProfile, error) {
 	var p tree.Profile
 	if err := pprof.Decode(bytes.NewReader(b), &p); err != nil {
 		return nil, fmt.Errorf("parsing pprof: %w", err)
 	}
-	// TODO(abeaumont): Support multiple sample types
+	fbs := make([]*flamebearer.FlamebearerProfile, 0)
 	for _, stype := range p.SampleTypes() {
 		sampleRate := uint32(100)
 		units := metadata.SamplesUnits
@@ -205,7 +208,7 @@ func PprofToProfile(b []byte, name string, maxNodes int) (*flamebearer.Flamebear
 		})
 		fb := flamebearer.NewProfile(flamebearer.ProfileConfig{
 			Tree:     t,
-			Name:     name,
+			Name:     stype,
 			MaxNodes: maxNodes,
 			Metadata: metadata.Metadata{
 				SpyName:    "unknown",
@@ -213,12 +216,15 @@ func PprofToProfile(b []byte, name string, maxNodes int) (*flamebearer.Flamebear
 				Units:      units,
 			},
 		})
-		return &fb, nil
+		fbs = append(fbs, &fb)
 	}
-	return nil, errors.New("no supported sample type found")
+	if len(fbs) == 0 {
+		return nil, errors.New("no supported sample type found")
+	}
+	return fbs, nil
 }
 
-func CollapsedToProfile(b []byte, name string, maxNodes int) (*flamebearer.FlamebearerProfile, error) {
+func CollapsedToProfile(b []byte, name string, maxNodes int) ([]*flamebearer.FlamebearerProfile, error) {
 	t := tree.New()
 	for _, line := range bytes.Split(b, []byte("\n")) {
 		if len(line) == 0 {
@@ -243,10 +249,10 @@ func CollapsedToProfile(b []byte, name string, maxNodes int) (*flamebearer.Flame
 			SampleRate: 100, // We don't have this information, use the default
 		},
 	})
-	return &fb, nil
+	return []*flamebearer.FlamebearerProfile{&fb}, nil
 }
 
-func PerfScriptToProfile(b []byte, name string, maxNodes int) (*flamebearer.FlamebearerProfile, error) {
+func PerfScriptToProfile(b []byte, name string, maxNodes int) ([]*flamebearer.FlamebearerProfile, error) {
 	t := tree.New()
 	p := perf.NewScriptParser(b)
 	events, err := p.ParseEvents()
@@ -265,5 +271,5 @@ func PerfScriptToProfile(b []byte, name string, maxNodes int) (*flamebearer.Flam
 			SampleRate: 100, // We don't have this information, use the default
 		},
 	})
-	return &fb, nil
+	return []*flamebearer.FlamebearerProfile{&fb}, nil
 }

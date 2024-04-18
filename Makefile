@@ -31,9 +31,15 @@ EMBEDASSETS ?= embedassets
 VPREFIX := github.com/grafana/pyroscope/pkg/util/build
 GO_LDFLAGS   := -X $(VPREFIX).Branch=$(GIT_BRANCH) -X $(VPREFIX).Version=$(IMAGE_TAG) -X $(VPREFIX).Revision=$(GIT_REVISION) -X $(VPREFIX).BuildDate=$(GIT_LAST_COMMIT_DATE)
 
+# Folders with go.mod file
+GO_MOD_PATHS := api/ ebpf/ examples/language-sdk-instrumentation/golang-push/rideshare examples/language-sdk-instrumentation/golang-push/simple/
+
+# Add extra arguments to helm commands
+HELM_ARGS =
+
 .PHONY: help
 help: ## Describe useful make targets
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "%-30s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_/-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ": .*?## "}; {printf "%-50s %s\n", $$1, $$2}'
 
 .PHONY: all
 all: lint test build ## Build, test, and lint (default)
@@ -50,7 +56,7 @@ generate: $(BIN)/buf $(BIN)/protoc-gen-go $(BIN)/protoc-gen-go-vtproto $(BIN)/pr
 	find pkg/ \( -name \*.pb.go -o -name \*.connect\*.go \) -delete
 	cd api/ && PATH=$(BIN) $(BIN)/buf generate
 	cd pkg && PATH=$(BIN) $(BIN)/buf generate
-	PATH=$(BIN):$(PATH) ./tools/add-parquet-tags.sh
+	PATH="$(BIN):$(PATH)" ./tools/add-parquet-tags.sh
 	go run ./tools/doc-generator/ ./docs/sources/configure-server/reference-configuration-parameters/index.template > docs/sources/configure-server/reference-configuration-parameters/index.md
 
 .PHONY: buf/lint
@@ -58,9 +64,11 @@ buf/lint: $(BIN)/buf
 	cd api/ && $(BIN)/buf lint || true # TODO: Fix linting problems and remove the always true
 	cd pkg && $(BIN)/buf lint || true # TODO: Fix linting problems and remove the always true
 
+EBPF_TESTS='^TestEBPF.*'
+
 .PHONY: go/test
 go/test: $(BIN)/gotestsum
-	$(BIN)/gotestsum -- $(GO_TEST_FLAGS) ./... ./ebpf/...
+	$(BIN)/gotestsum -- $(GO_TEST_FLAGS) -skip $(EBPF_TESTS) ./... ./ebpf/...
 
 .PHONY: build
 build: frontend/build go/bin ## Do a production build (requiring the frontend build to be present)
@@ -124,16 +132,20 @@ go/lint: $(BIN)/golangci-lint
 	$(GO) vet ./...
 
 .PHONY: go/mod
-go/mod:
+go/mod: $(foreach P,$(GO_MOD_PATHS),go/mod_tidy/$P)
+
+.PHONY: go/mod_tidy_root
+go/mod_tidy_root:
 	GO111MODULE=on go mod download
 	# doesn't work for go workspace
 	# GO111MODULE=on go mod verify
 	go work sync
 	GO111MODULE=on go mod tidy
-	cd api/ && GO111MODULE=on go mod download
-	cd api/ && GO111MODULE=on go mod tidy
-	cd ebpf/ && GO111MODULE=on go mod download
-	cd ebpf/ && GO111MODULE=on go mod tidy
+
+.PHONY: go/mod_tidy/%
+go/mod_tidy/%: go/mod_tidy_root
+	cd "$*" && GO111MODULE=on go mod download
+	cd "$*" && GO111MODULE=on go mod tidy
 
 .PHONY: fmt
 fmt: $(BIN)/golangci-lint $(BIN)/buf $(BIN)/tk ## Automatically fix some lint errors
@@ -141,7 +153,7 @@ fmt: $(BIN)/golangci-lint $(BIN)/buf $(BIN)/tk ## Automatically fix some lint er
 	$(BIN)/golangci-lint run --fix
 	cd api/ && $(BIN)/buf format -w .
 	cd pkg && $(BIN)/buf format -w .
-	$(BIN)/tk fmt ./operations/phlare/jsonnet/ tools/monitoring/
+	$(BIN)/tk fmt ./operations/pyroscope/jsonnet/ tools/monitoring/
 
 .PHONY: check/unstaged-changes
 check/unstaged-changes:
@@ -161,16 +173,16 @@ define deploy
 	# Load image into nodes
 	$(BIN)/kind load docker-image --name $(KIND_CLUSTER) $(IMAGE_PREFIX)pyroscope:$(IMAGE_TAG)
 	kubectl get pods
-	$(BIN)/helm upgrade --install $(1) ./operations/phlare/helm/phlare $(2) \
-		--set phlare.image.tag=$(IMAGE_TAG) \
-		--set phlare.image.repository=$(IMAGE_PREFIX)pyroscope \
-		--set phlare.podAnnotations.image-id=$(shell cat .docker-image-id-pyroscope) \
-		--set phlare.service.port_name=http-metrics \
-		--set phlare.podAnnotations."profiles\.grafana\.com\/memory\.port_name"=http-metrics \
-		--set phlare.podAnnotations."profiles\.grafana\.com\/cpu\.port_name"=http-metrics \
-		--set phlare.podAnnotations."profiles\.grafana\.com\/goroutine\.port_name"=http-metrics \
-		--set phlare.extraEnvVars.JAEGER_AGENT_HOST=jaeger.monitoring.svc.cluster.local. \
-		--set phlare.extraArgs."phlaredb\.max-block-duration"=5m
+	$(BIN)/helm upgrade --install $(1) ./operations/pyroscope/helm/pyroscope $(2) $(HELM_ARGS) \
+		--set pyroscope.image.tag=$(IMAGE_TAG) \
+		--set pyroscope.image.repository=$(IMAGE_PREFIX)pyroscope \
+		--set pyroscope.podAnnotations.image-id=$(shell cat .docker-image-id-pyroscope) \
+		--set pyroscope.service.port_name=http-metrics \
+		--set pyroscope.podAnnotations."profiles\.grafana\.com\/memory\.port_name"=http-metrics \
+		--set pyroscope.podAnnotations."profiles\.grafana\.com\/cpu\.port_name"=http-metrics \
+		--set pyroscope.podAnnotations."profiles\.grafana\.com\/goroutine\.port_name"=http-metrics \
+		--set pyroscope.extraEnvVars.JAEGER_AGENT_HOST=jaeger.monitoring.svc.cluster.local. \
+		--set pyroscope.extraArgs."pyroscopedb\.max-block-duration"=5m
   endef
 
 .PHONY: docker-image/pyroscope/build-debug
@@ -193,19 +205,34 @@ docker-image/pyroscope/push: frontend/build go/bin
 
 define UPDATER_CONFIG_JSON
 {
+  "git_author_name": "grafana-pyroscope-bot[bot]",
+  "git_author_email": "140177480+grafana-pyroscope-bot[bot]@users.noreply.github.com",
+  "git_committer_name": "grafana-pyroscope-bot[bot]",
+  "git_committer_email": "140177480+grafana-pyroscope-bot[bot]@users.noreply.github.com",
+  "pull_request_enabled": true,
+  "pull_request_branch_prefix": "auto-merge/grafana-pyroscope-bot",
   "repo_name": "deployment_tools",
   "destination_branch": "master",
-  "wait_for_ci": true,
-  "wait_for_ci_branch_prefix": "automation/pyroscope-dev-deploy",
-  "wait_for_ci_timeout": "10m",
-  "wait_for_ci_required_status": [
-    "continuous-integration/drone/push"
-  ],
   "update_jsonnet_attribute_configs": [
     {
-      "file_path": "ksonnet/environments/phlare/waves/dev.libsonnet",
-      "jsonnet_key": "phlare",
+      "file_path": "ksonnet/lib/pyroscope/releases/dev/images.libsonnet",
+      "jsonnet_key": "pyroscope",
       "jsonnet_value": "$(IMAGE_PREFIX)pyroscope:$(IMAGE_TAG)"
+    }
+  ],
+  "update_jsonnet_lib_configs": [
+    {
+      "jsonnet_dir": "ksonnet/lib/pyroscope/releases/dev",
+      "dependencies": [
+        {
+          "owner": "grafana",
+          "name": "pyroscope",
+          "version": "$(GIT_REVISION)",
+          "sub_dirs": [
+            "operations/pyroscope"
+          ]
+        }
+      ]
     }
   ]
 }
@@ -213,8 +240,8 @@ endef
 
 .PHONY: docker-image/pyroscope/deploy-dev-001
 docker-image/pyroscope/deploy-dev-001: export CONFIG_JSON:=$(call UPDATER_CONFIG_JSON)
-docker-image/pyroscope/deploy-dev-001: $(BIN)/updater
-	$(BIN)/updater
+docker-image/pyroscope/deploy-dev-001: $(BIN)/updater $(BIN)/jb
+	PATH=$(BIN):$(PATH) $(BIN)/updater
 
 .PHONY: clean
 clean: ## Delete intermediate build artifacts
@@ -229,35 +256,35 @@ reference-help: build
 
 $(BIN)/buf: Makefile
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/bufbuild/buf/cmd/buf@v1.20.0
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/bufbuild/buf/cmd/buf@v1.28.1
 
 $(BIN)/golangci-lint: Makefile
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.52.2
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.54.0
 
 $(BIN)/protoc-gen-go: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.0
+	GOBIN=$(abspath $(@D)) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@v1.32.0
 
 $(BIN)/protoc-gen-connect-go: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/bufbuild/connect-go/cmd/protoc-gen-connect-go@v0.1.0
+	GOBIN=$(abspath $(@D)) $(GO) install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.14.0
 
 $(BIN)/protoc-gen-connect-go-mux: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/grafana/connect-go-mux/cmd/protoc-gen-connect-go-mux@v0.1.1
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/grafana/connect-go-mux/cmd/protoc-gen-connect-go-mux@v0.2.0
 
 $(BIN)/protoc-gen-go-vtproto: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/grafana/vtprotobuf/cmd/protoc-gen-go-vtproto@69fa34dad3472084bcae0b557e8813e6d4678f2b
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/grafana/vtprotobuf/cmd/protoc-gen-go-vtproto@5b3aae6571b83099f5a6cd803e8d72296550a973
 
 $(BIN)/protoc-gen-openapiv2: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@v2.10.3
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@v2.16.0
 
 $(BIN)/protoc-gen-grpc-gateway: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@v2.10.3
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@v2.16.0
 
 $(BIN)/gomodifytags: Makefile go.mod
 	@mkdir -p $(@D)
@@ -277,11 +304,11 @@ $(BIN)/jb: Makefile go.mod
 
 $(BIN)/helm: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install helm.sh/helm/v3/cmd/helm@v3.8.0
+	GOBIN=$(abspath $(@D)) $(GO) install helm.sh/helm/v3/cmd/helm@v3.14.3
 
 $(BIN)/kubeconform: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/yannh/kubeconform/cmd/kubeconform@v0.5.0
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.4
 
 $(BIN)/mage: Makefile go.mod
 	@mkdir -p $(@D)
@@ -293,7 +320,7 @@ $(BIN)/updater: Makefile
 
 $(BIN)/goreleaser: Makefile go.mod
 	@mkdir -p $(@D)
-	GOBIN=$(abspath $(@D)) $(GO) install github.com/goreleaser/goreleaser@v1.14.1
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/goreleaser/goreleaser@v1.20.0
 
 $(BIN)/gotestsum: Makefile go.mod
 	@mkdir -p $(@D)
@@ -318,14 +345,18 @@ $(BIN)/trunk: Makefile
 	curl -L https://trunk.io/releases/trunk -o $(@D)/trunk
 	chmod +x $(@D)/trunk
 
+.PHONY: cve/check
+cve/check:
+	docker run -t -i --rm --volume "$(CURDIR)/:/repo" -u "$(shell id -u)" aquasec/trivy:0.45.1 filesystem --cache-dir /repo/.cache/trivy --scanners vuln --skip-dirs .tmp/ --skip-dirs node_modules/ --skip-dirs tools/monitoring/vendor/ /repo
+
 KIND_CLUSTER = pyroscope-dev
 
 .PHONY: helm/lint
 helm/lint: $(BIN)/helm
-	$(BIN)/helm lint ./operations/phlare/helm/phlare/
+	$(BIN)/helm lint ./operations/pyroscope/helm/pyroscope/
 
 helm/docs: $(BIN)/helm
-	docker run --rm --volume "$(CURDIR)/operations/phlare/helm:/helm-docs" -u "$(shell id -u)" jnorwood/helm-docs:v1.8.1
+	docker run --rm --volume "$(CURDIR)/operations/pyroscope/helm:/helm-docs" -u "$(shell id -u)" jnorwood/helm-docs:v1.13.1
 
 .PHONY: goreleaser/lint
 goreleaser/lint: $(BIN)/goreleaser
@@ -342,30 +373,40 @@ trunk/fmt: $(BIN)/trunk
 .PHONY: helm/check
 helm/check: $(BIN)/kubeconform $(BIN)/helm
 	$(BIN)/helm repo add --force-update minio https://charts.min.io/
-	$(BIN)/helm dependency build ./operations/phlare/helm/phlare/
-	mkdir -p ./operations/phlare/helm/phlare/rendered/
-	$(BIN)/helm template phlare-dev ./operations/phlare/helm/phlare/ \
-		| tee ./operations/phlare/helm/phlare/rendered/single-binary.yaml \
-		| $(BIN)/kubeconform --summary --strict --kubernetes-version 1.21.0
-	$(BIN)/helm template phlare-dev ./operations/phlare/helm/phlare/ --values operations/phlare/helm/phlare/values-micro-services.yaml \
-		| tee ./operations/phlare/helm/phlare/rendered/micro-services.yaml \
-		| $(BIN)/kubeconform --summary --strict --kubernetes-version 1.21.0
-	cat operations/phlare/helm/phlare/values-micro-services.yaml \
+	$(BIN)/helm repo add --force-update grafana https://grafana.github.io/helm-charts
+	$(BIN)/helm dependency update ./operations/pyroscope/helm/pyroscope/
+	$(BIN)/helm dependency build ./operations/pyroscope/helm/pyroscope/
+	mkdir -p ./operations/pyroscope/helm/pyroscope/rendered/
+	$(BIN)/helm template -n default --kube-version "1.23.0" pyroscope-dev ./operations/pyroscope/helm/pyroscope/ \
+		| tee ./operations/pyroscope/helm/pyroscope/rendered/single-binary.yaml \
+		| $(BIN)/kubeconform --summary --strict --kubernetes-version 1.23.0
+	$(BIN)/helm template -n default --kube-version "1.23.0" pyroscope-dev ./operations/pyroscope/helm/pyroscope/ --values operations/pyroscope/helm/pyroscope/values-micro-services.yaml \
+		| tee ./operations/pyroscope/helm/pyroscope/rendered/micro-services.yaml \
+		| $(BIN)/kubeconform --summary --strict --kubernetes-version 1.23.0
+	$(BIN)/helm template -n default --kube-version "1.23.0" pyroscope-dev ./operations/pyroscope/helm/pyroscope/ --values operations/pyroscope/helm/pyroscope/values-micro-services-hpa.yaml \
+		| tee ./operations/pyroscope/helm/pyroscope/rendered/micro-services-hpa.yaml \
+		| $(BIN)/kubeconform --summary --strict --kubernetes-version 1.23.0
+	cat operations/pyroscope/helm/pyroscope/values-micro-services.yaml \
 		| go run ./tools/yaml-to-json \
-		> ./operations/phlare/jsonnet/values-micro-services.json
-	cat operations/phlare/helm/phlare/values.yaml \
+		> ./operations/pyroscope/jsonnet/values-micro-services.json
+		cat operations/pyroscope/helm/pyroscope/values-micro-services-hpa.yaml \
 		| go run ./tools/yaml-to-json \
-		> ./operations/phlare/jsonnet/values.json
+		> ./operations/pyroscope/jsonnet/values-micro-services-hpa.json
+	cat operations/pyroscope/helm/pyroscope/values.yaml \
+		| go run ./tools/yaml-to-json \
+		> ./operations/pyroscope/jsonnet/values.json
 
 .PHONY: deploy
 deploy: $(BIN)/kind $(BIN)/helm docker-image/pyroscope/build
-	$(call deploy,phlare-dev,)
+	$(call deploy,pyroscope-dev,)
 	# Create a service to provide the same endpoint as micro-services
-	echo '{"kind":"Service","apiVersion":"v1","metadata":{"name":"phlare-micro-services-query-frontend"},"spec":{"ports":[{"name":"phlare","port":4100,"targetPort":4100}],"selector":{"app.kubernetes.io/component":"all","app.kubernetes.io/instance":"phlare-dev"},"type":"ClusterIP"}}' | kubectl apply -f -
+	echo '{"kind":"Service","apiVersion":"v1","metadata":{"name":"pyroscope-micro-services-query-frontend"},"spec":{"ports":[{"name":"pyroscope","port":4040,"targetPort":4040}],"selector":{"app.kubernetes.io/component":"all","app.kubernetes.io/instance":"pyroscope-dev"},"type":"ClusterIP"}}' | kubectl apply -f -
 
 .PHONY: deploy-micro-services
 deploy-micro-services: $(BIN)/kind $(BIN)/helm docker-image/pyroscope/build
-	$(call deploy,phlare-micro-services,--values=operations/phlare/helm/phlare/values-micro-services.yaml --set phlare.components.querier.resources=null --set phlare.components.distributor.resources=null --set phlare.components.ingester.resources=null --set phlare.components.store-gateway.resources=null)
+	# Ensure to delete existing service, that has been created manually by the deploy target
+	kubectl delete svc --field-selector metadata.name=pyroscope-micro-services-query-frontend -l app.kubernetes.io/managed-by!=Helm
+	$(call deploy,pyroscope-micro-services,--values=operations/pyroscope/helm/pyroscope/values-micro-services.yaml --set pyroscope.components.querier.resources=null --set pyroscope.components.distributor.resources=null --set pyroscope.components.ingester.resources=null --set pyroscope.components.store-gateway.resources=null --set pyroscope.components.compactor.resources=null)
 
 .PHONY: deploy-monitoring
 deploy-monitoring: $(BIN)/tk $(BIN)/kind tools/monitoring/environments/default/spec.json
@@ -377,18 +418,14 @@ tools/monitoring/environments/default/spec.json: $(BIN)/tk $(BIN)/kind
 	$(BIN)/kind export kubeconfig --name $(KIND_CLUSTER) || $(BIN)/kind create cluster --name $(KIND_CLUSTER)
 	pushd tools/monitoring/ && rm -Rf vendor/ lib/ environments/default/spec.json  && PATH=$(BIN):$(PATH) $(BIN)/tk init -f
 	echo "import 'monitoring.libsonnet'" > tools/monitoring/environments/default/main.jsonnet
-	$(BIN)/tk env set tools/monitoring/environments/default --server=$(shell $(BIN)/kind get kubeconfig --name phlare-dev | grep server: | sed 's/server://g' | xargs) --namespace=monitoring
+	$(BIN)/tk env set tools/monitoring/environments/default --server=$(shell $(BIN)/kind get kubeconfig --name pyroscope-dev | grep server: | sed 's/server://g' | xargs) --namespace=monitoring
 
-.PHONY: deploy-demo
-deploy-demo: $(BIN)/kind
-	docker build -t cp-java-simple:0.1.0 ./tools/docker-compose/java/simple
-	$(BIN)/kind load docker-image --name $(KIND_CLUSTER) cp-java-simple:0.1.0
-	kubectl  --context="kind-$(KIND_CLUSTER)" apply -f ./tools/kubernetes/java-simple-deployment.yaml
+include Makefile.examples
 
 .PHONY: docs/%
 docs/%:
 	$(MAKE) -C docs $*
 
 .PHONY: run
-run: ## Run the phlare binary (pass parameters with 'make run PARAMS=-myparam')
+run: ## Run the pyroscope binary (pass parameters with 'make run PARAMS=-myparam')
 	./pyroscope $(PARAMS)

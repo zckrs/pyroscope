@@ -5,9 +5,9 @@
 package httpgrpcconnect
 
 import (
+	connect "connectrpc.com/connect"
 	context "context"
 	errors "errors"
-	connect_go "github.com/bufbuild/connect-go"
 	httpgrpc "github.com/grafana/pyroscope/pkg/util/httpgrpc"
 	http "net/http"
 	strings "strings"
@@ -18,16 +18,34 @@ import (
 // generated with a version of connect newer than the one compiled into your binary. You can fix the
 // problem by either regenerating this code with an older version of connect or updating the connect
 // version compiled into your binary.
-const _ = connect_go.IsAtLeastVersion0_1_0
+const _ = connect.IsAtLeastVersion1_13_0
 
 const (
 	// HTTPName is the fully-qualified name of the HTTP service.
 	HTTPName = "httpgrpc.HTTP"
 )
 
+// These constants are the fully-qualified names of the RPCs defined in this package. They're
+// exposed at runtime as Spec.Procedure and as the final two segments of the HTTP route.
+//
+// Note that these are different from the fully-qualified method names used by
+// google.golang.org/protobuf/reflect/protoreflect. To convert from these constants to
+// reflection-formatted method names, remove the leading slash and convert the remaining slash to a
+// period.
+const (
+	// HTTPHandleProcedure is the fully-qualified name of the HTTP's Handle RPC.
+	HTTPHandleProcedure = "/httpgrpc.HTTP/Handle"
+)
+
+// These variables are the protoreflect.Descriptor objects for the RPCs defined in this package.
+var (
+	hTTPServiceDescriptor      = httpgrpc.File_util_httpgrpc_httpgrpc_proto.Services().ByName("HTTP")
+	hTTPHandleMethodDescriptor = hTTPServiceDescriptor.Methods().ByName("Handle")
+)
+
 // HTTPClient is a client for the httpgrpc.HTTP service.
 type HTTPClient interface {
-	Handle(context.Context, *connect_go.Request[httpgrpc.HTTPRequest]) (*connect_go.Response[httpgrpc.HTTPResponse], error)
+	Handle(context.Context, *connect.Request[httpgrpc.HTTPRequest]) (*connect.Response[httpgrpc.HTTPResponse], error)
 }
 
 // NewHTTPClient constructs a client for the httpgrpc.HTTP service. By default, it uses the Connect
@@ -37,30 +55,31 @@ type HTTPClient interface {
 //
 // The URL supplied here should be the base URL for the Connect or gRPC server (for example,
 // http://api.acme.com or https://acme.com/grpc).
-func NewHTTPClient(httpClient connect_go.HTTPClient, baseURL string, opts ...connect_go.ClientOption) HTTPClient {
+func NewHTTPClient(httpClient connect.HTTPClient, baseURL string, opts ...connect.ClientOption) HTTPClient {
 	baseURL = strings.TrimRight(baseURL, "/")
 	return &hTTPClient{
-		handle: connect_go.NewClient[httpgrpc.HTTPRequest, httpgrpc.HTTPResponse](
+		handle: connect.NewClient[httpgrpc.HTTPRequest, httpgrpc.HTTPResponse](
 			httpClient,
-			baseURL+"/httpgrpc.HTTP/Handle",
-			opts...,
+			baseURL+HTTPHandleProcedure,
+			connect.WithSchema(hTTPHandleMethodDescriptor),
+			connect.WithClientOptions(opts...),
 		),
 	}
 }
 
 // hTTPClient implements HTTPClient.
 type hTTPClient struct {
-	handle *connect_go.Client[httpgrpc.HTTPRequest, httpgrpc.HTTPResponse]
+	handle *connect.Client[httpgrpc.HTTPRequest, httpgrpc.HTTPResponse]
 }
 
 // Handle calls httpgrpc.HTTP.Handle.
-func (c *hTTPClient) Handle(ctx context.Context, req *connect_go.Request[httpgrpc.HTTPRequest]) (*connect_go.Response[httpgrpc.HTTPResponse], error) {
+func (c *hTTPClient) Handle(ctx context.Context, req *connect.Request[httpgrpc.HTTPRequest]) (*connect.Response[httpgrpc.HTTPResponse], error) {
 	return c.handle.CallUnary(ctx, req)
 }
 
 // HTTPHandler is an implementation of the httpgrpc.HTTP service.
 type HTTPHandler interface {
-	Handle(context.Context, *connect_go.Request[httpgrpc.HTTPRequest]) (*connect_go.Response[httpgrpc.HTTPResponse], error)
+	Handle(context.Context, *connect.Request[httpgrpc.HTTPRequest]) (*connect.Response[httpgrpc.HTTPResponse], error)
 }
 
 // NewHTTPHandler builds an HTTP handler from the service implementation. It returns the path on
@@ -68,19 +87,26 @@ type HTTPHandler interface {
 //
 // By default, handlers support the Connect, gRPC, and gRPC-Web protocols with the binary Protobuf
 // and JSON codecs. They also support gzip compression.
-func NewHTTPHandler(svc HTTPHandler, opts ...connect_go.HandlerOption) (string, http.Handler) {
-	mux := http.NewServeMux()
-	mux.Handle("/httpgrpc.HTTP/Handle", connect_go.NewUnaryHandler(
-		"/httpgrpc.HTTP/Handle",
+func NewHTTPHandler(svc HTTPHandler, opts ...connect.HandlerOption) (string, http.Handler) {
+	hTTPHandleHandler := connect.NewUnaryHandler(
+		HTTPHandleProcedure,
 		svc.Handle,
-		opts...,
-	))
-	return "/httpgrpc.HTTP/", mux
+		connect.WithSchema(hTTPHandleMethodDescriptor),
+		connect.WithHandlerOptions(opts...),
+	)
+	return "/httpgrpc.HTTP/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case HTTPHandleProcedure:
+			hTTPHandleHandler.ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
 }
 
 // UnimplementedHTTPHandler returns CodeUnimplemented from all methods.
 type UnimplementedHTTPHandler struct{}
 
-func (UnimplementedHTTPHandler) Handle(context.Context, *connect_go.Request[httpgrpc.HTTPRequest]) (*connect_go.Response[httpgrpc.HTTPResponse], error) {
-	return nil, connect_go.NewError(connect_go.CodeUnimplemented, errors.New("httpgrpc.HTTP.Handle is not implemented"))
+func (UnimplementedHTTPHandler) Handle(context.Context, *connect.Request[httpgrpc.HTTPRequest]) (*connect.Response[httpgrpc.HTTPResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("httpgrpc.HTTP.Handle is not implemented"))
 }

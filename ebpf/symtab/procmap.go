@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"unsafe"
 )
 
@@ -20,6 +21,36 @@ type ProcMapPermissions struct {
 	Shared bool
 	// mapping is marked as [P]rivate (copy on write)
 	Private bool
+}
+
+func (p *ProcMapPermissions) String() string {
+	var res string
+	if p.Read {
+		res += "r"
+	} else {
+		res += "-"
+	}
+	if p.Write {
+		res += "w"
+	} else {
+		res += "-"
+	}
+	if p.Execute {
+		res += "x"
+	} else {
+		res += "-"
+	}
+	if p.Shared {
+		res += "s"
+	} else {
+		res += "-"
+	}
+	if p.Private {
+		res += "p"
+	} else {
+		res += "-"
+	}
+	return res
 }
 
 // ProcMap contains the process memory-mappings of the process
@@ -39,6 +70,22 @@ type ProcMap struct {
 	Inode uint64
 	// The file or psuedofile (or empty==anonymous)
 	Pathname string
+}
+
+func (p *ProcMap) String() string {
+	return fmt.Sprintf("%x-%x %s %x %x:%x %s",
+		p.StartAddr, p.EndAddr, p.Perms.String(), p.Offset, p.Dev, p.Inode, p.Pathname)
+}
+
+type ProcMaps []*ProcMap
+
+func (p ProcMaps) String() string {
+	var sb strings.Builder
+	for _, m := range p {
+		sb.WriteString(m.String())
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 type file struct {
@@ -146,11 +193,11 @@ func parsePermissions(s []byte) (*ProcMapPermissions, error) {
 	return &perms, nil
 }
 
-// parseProcMap will attempt to parse a single line within a proc/[pid]/maps
+// ParseProcMapLine will attempt to parse a single line within a proc/[pid]/maps
 // buffer.
 // 7f5822ebe000-7f5822ec0000 r--p 00000000 09:00 533429                     /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 // returns nil if entry is not executable
-func parseProcMap(line []byte) (*ProcMap, error) {
+func ParseProcMapLine(line []byte, executableOnly bool) (*ProcMap, error) {
 	var i int
 	if i = bytes.IndexByte(line, ' '); i == -1 {
 		return nil, fmt.Errorf("invalid procmap entry: %s", line)
@@ -190,7 +237,7 @@ func parseProcMap(line []byte) (*ProcMap, error) {
 		return nil, err
 	}
 
-	if !perms.Execute {
+	if executableOnly && !perms.Execute {
 		return nil, nil
 	}
 
@@ -234,7 +281,7 @@ func parseProcMap(line []byte) (*ProcMap, error) {
 	}, nil
 }
 
-func parseProcMapsExecutableModules(procMaps []byte) ([]*ProcMap, error) {
+func ParseProcMapsExecutableModules(procMaps []byte, executableOnly bool) ([]*ProcMap, error) {
 	var modules []*ProcMap
 	for len(procMaps) > 0 {
 		nl := bytes.IndexByte(procMaps, '\n')
@@ -249,7 +296,7 @@ func parseProcMapsExecutableModules(procMaps []byte) ([]*ProcMap, error) {
 		if len(line) == 0 {
 			continue
 		}
-		m, err := parseProcMap(line)
+		m, err := ParseProcMapLine(line, executableOnly)
 		if err != nil {
 			return nil, err
 		}
@@ -263,10 +310,30 @@ func parseProcMapsExecutableModules(procMaps []byte) ([]*ProcMap, error) {
 
 func tokenToStringUnsafe(tok []byte) string {
 	res := ""
-	// todo remove unsafe
-
 	sh := (*reflect.StringHeader)(unsafe.Pointer(&res))
 	sh.Data = uintptr(unsafe.Pointer(&tok[0]))
 	sh.Len = len(tok)
 	return res
+}
+
+func FindLastRXMap(maps []*ProcMap) *ProcMap {
+	for i := len(maps) - 1; i >= 0; i-- {
+		m := maps[i]
+		if m.Perms.Read && m.Perms.Execute {
+			return m
+		}
+	}
+	return nil
+}
+
+// FindReadableMap return a map entry that is readable and not writable or nil
+func FindReadableMap(maps []*ProcMap) *ProcMap {
+	var readable *ProcMap
+	for _, m := range maps {
+		if m.Perms.Read && !m.Perms.Write {
+			readable = m
+			break
+		}
+	}
+	return readable
 }

@@ -1,7 +1,9 @@
 package iter
 
 import (
+	"context"
 	"sort"
+	"sync"
 
 	"github.com/samber/lo"
 	"golang.org/x/exp/constraints"
@@ -101,6 +103,20 @@ func NewSliceSeekIterator[A constraints.Ordered](s []A) SeekIterator[A, A] {
 	}
 }
 
+type slicePositionIterator[T constraints.Integer, M any] struct {
+	i Iterator[T]
+	s []M
+}
+
+func NewSliceIndexIterator[T constraints.Integer, M any](s []M, i Iterator[T]) Iterator[M] {
+	return slicePositionIterator[T, M]{s: s, i: i}
+}
+
+func (i slicePositionIterator[T, M]) Next() bool   { return i.i.Next() }
+func (i slicePositionIterator[T, M]) At() M        { return i.s[i.i.At()] }
+func (i slicePositionIterator[T, M]) Err() error   { return i.i.Err() }
+func (i slicePositionIterator[T, M]) Close() error { return i.i.Close() }
+
 type sliceSeekIterator[A constraints.Ordered] struct {
 	*sliceIterator[A]
 }
@@ -136,6 +152,9 @@ func (i *sliceIterator[A]) Close() error {
 }
 
 func Slice[T any](it Iterator[T]) ([]T, error) {
+	if s, ok := it.(*sliceIterator[T]); ok {
+		return s.list, nil
+	}
 	var result []T
 	defer it.Close()
 	for it.Next() {
@@ -229,22 +248,38 @@ type BufferedIterator[T any] struct {
 	Iterator[T]
 	buff chan T
 	at   T
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // NewBufferedIterator returns an iterator that reads asynchronously from the given iterator and buffers up to size elements.
 func NewBufferedIterator[T any](it Iterator[T], size int) Iterator[T] {
+	ctx, cancel := context.WithCancel(context.Background())
 	buffered := &BufferedIterator[T]{
 		Iterator: it,
 		buff:     make(chan T, size),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
+
+	buffered.wg.Add(1)
 	go buffered.fill()
 	return buffered
 }
 
 func (it *BufferedIterator[T]) fill() {
+	defer it.wg.Done()
 	defer close(it.buff)
+
 	for it.Iterator.Next() {
-		it.buff <- it.Iterator.At()
+		select {
+		case <-it.ctx.Done():
+			return
+		case it.buff <- it.Iterator.At():
+			continue
+		}
 	}
 }
 
@@ -256,6 +291,17 @@ func (it *BufferedIterator[T]) Next() bool {
 	return ok
 }
 
+func (it *BufferedIterator[T]) Err() error {
+	return it.Iterator.Err()
+}
+
 func (it *BufferedIterator[T]) At() T {
 	return it.at
+}
+
+func (it *BufferedIterator[T]) Close() error {
+	err := it.Iterator.Close()
+	it.cancel()
+	it.wg.Wait()
+	return err
 }

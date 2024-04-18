@@ -1,0 +1,14 @@
+version: '3'
+services:
+  pyroscope:
+    image: grafana/pyroscope
+    command:
+      - -api.base-url
+      - /pyroscope
+
+  nginx:
+    image: nginx
+    ports:
+      - '8080:8080'
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf

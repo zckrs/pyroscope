@@ -27,27 +27,32 @@ import (
 func TestOverridesExporter_withConfig(t *testing.T) {
 	tenantLimits := map[string]*validation.Limits{
 		"tenant-a": {
-			IngestionRateMB:          10,
-			IngestionBurstSizeMB:     11,
-			MaxGlobalSeriesPerTenant: 12,
-			MaxLocalSeriesPerTenant:  13,
-			MaxLabelNameLength:       14,
-			MaxLabelValueLength:      15,
-			MaxLabelNamesPerSeries:   16,
-			MaxQueryLookback:         17,
-			MaxQueryLength:           18,
-			MaxQueryParallelism:      19,
-			QuerySplitDuration:       20,
+			IngestionRateMB:              10,
+			IngestionBurstSizeMB:         11,
+			MaxGlobalSeriesPerTenant:     12,
+			MaxLocalSeriesPerTenant:      13,
+			MaxLabelNameLength:           14,
+			MaxLabelValueLength:          15,
+			MaxLabelNamesPerSeries:       16,
+			MaxQueryLookback:             17,
+			MaxQueryLength:               18,
+			MaxQueryParallelism:          19,
+			QuerySplitDuration:           20,
+			MaxSessionsPerSeries:         21,
+			DistributorAggregationWindow: 22,
+			DistributorAggregationPeriod: 23,
+			MaxFlameGraphNodesDefault:    24,
+			MaxFlameGraphNodesMax:        25,
 		},
 	}
 	ringStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 	cfg1 := Config{RingConfig{}}
-	cfg1.Ring.KVStore.Mock = ringStore
-	cfg1.Ring.InstancePort = 1234
-	cfg1.Ring.HeartbeatPeriod = 15 * time.Second
-	cfg1.Ring.HeartbeatTimeout = 1 * time.Minute
+	cfg1.Ring.Ring.KVStore.Mock = ringStore
+	cfg1.Ring.Ring.InstancePort = 1234
+	cfg1.Ring.Ring.HeartbeatPeriod = 15 * time.Second
+	cfg1.Ring.Ring.HeartbeatTimeout = 1 * time.Minute
 
 	// Create an empty ring.
 	ctx := context.Background()
@@ -56,20 +61,25 @@ func TestOverridesExporter_withConfig(t *testing.T) {
 	}))
 
 	// Create an overrides-exporter.
-	cfg1.Ring.InstanceID = "overrides-exporter-1"
-	cfg1.Ring.InstanceAddr = "1.2.3.1"
+	cfg1.Ring.Ring.InstanceID = "overrides-exporter-1"
+	cfg1.Ring.Ring.InstanceAddr = "1.2.3.1"
 	exporter, err := NewOverridesExporter(cfg1, &validation.Limits{
-		IngestionRateMB:          20,
-		IngestionBurstSizeMB:     21,
-		MaxGlobalSeriesPerTenant: 22,
-		MaxLocalSeriesPerTenant:  23,
-		MaxLabelNameLength:       24,
-		MaxLabelValueLength:      25,
-		MaxLabelNamesPerSeries:   26,
-		MaxQueryLookback:         27,
-		MaxQueryLength:           28,
-		MaxQueryParallelism:      29,
-		QuerySplitDuration:       30,
+		IngestionRateMB:              20,
+		IngestionBurstSizeMB:         21,
+		MaxGlobalSeriesPerTenant:     22,
+		MaxLocalSeriesPerTenant:      23,
+		MaxLabelNameLength:           24,
+		MaxLabelValueLength:          25,
+		MaxLabelNamesPerSeries:       26,
+		MaxQueryLookback:             27,
+		MaxQueryLength:               28,
+		MaxQueryParallelism:          29,
+		QuerySplitDuration:           30,
+		MaxSessionsPerSeries:         31,
+		DistributorAggregationWindow: 32,
+		DistributorAggregationPeriod: 33,
+		MaxFlameGraphNodesDefault:    34,
+		MaxFlameGraphNodesMax:        35,
 	}, validation.NewMockTenantLimits(tenantLimits), log.NewNopLogger(), nil)
 	require.NoError(t, err)
 
@@ -112,6 +122,11 @@ pyroscope_limits_overrides{limit_name="max_query_lookback",tenant="tenant-a"} 17
 pyroscope_limits_overrides{limit_name="max_query_length",tenant="tenant-a"} 18
 pyroscope_limits_overrides{limit_name="max_query_parallelism",tenant="tenant-a"} 19
 pyroscope_limits_overrides{limit_name="split_queries_by_interval",tenant="tenant-a"} 20
+pyroscope_limits_overrides{limit_name="max_sessions_per_series",tenant="tenant-a"} 21
+pyroscope_limits_overrides{limit_name="distributor_aggregation_window",tenant="tenant-a"} 22
+pyroscope_limits_overrides{limit_name="distributor_aggregation_period",tenant="tenant-a"} 23
+pyroscope_limits_overrides{limit_name="max_flamegraph_nodes_default",tenant="tenant-a"} 24
+pyroscope_limits_overrides{limit_name="max_flamegraph_nodes_max",tenant="tenant-a"} 25
 `
 
 	// Make sure each override matches the values from the supplied `Limit`
@@ -132,6 +147,11 @@ pyroscope_limits_defaults{limit_name="max_query_lookback"} 27
 pyroscope_limits_defaults{limit_name="max_query_length"} 28
 pyroscope_limits_defaults{limit_name="max_query_parallelism"} 29
 pyroscope_limits_defaults{limit_name="split_queries_by_interval"} 30
+pyroscope_limits_defaults{limit_name="max_sessions_per_series"} 31
+pyroscope_limits_defaults{limit_name="distributor_aggregation_window"} 32
+pyroscope_limits_defaults{limit_name="distributor_aggregation_period"} 33
+pyroscope_limits_defaults{limit_name="max_flamegraph_nodes_default"} 34
+pyroscope_limits_defaults{limit_name="max_flamegraph_nodes_max"} 35
 `
 	err = testutil.CollectAndCompare(exporter, bytes.NewBufferString(limitsMetrics), "pyroscope_limits_defaults")
 	assert.NoError(t, err)
@@ -146,10 +166,10 @@ func TestOverridesExporter_withRing(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 	cfg1 := Config{RingConfig{}}
-	cfg1.Ring.KVStore.Mock = ringStore
-	cfg1.Ring.InstancePort = 1234
-	cfg1.Ring.HeartbeatPeriod = 15 * time.Second
-	cfg1.Ring.HeartbeatTimeout = 1 * time.Minute
+	cfg1.Ring.Ring.KVStore.Mock = ringStore
+	cfg1.Ring.Ring.InstancePort = 1234
+	cfg1.Ring.Ring.HeartbeatPeriod = 15 * time.Second
+	cfg1.Ring.Ring.HeartbeatTimeout = 1 * time.Minute
 
 	// Create an empty ring.
 	ctx := context.Background()
@@ -158,8 +178,8 @@ func TestOverridesExporter_withRing(t *testing.T) {
 	}))
 
 	// Create an overrides-exporter.
-	cfg1.Ring.InstanceID = "overrides-exporter-1"
-	cfg1.Ring.InstanceAddr = "1.2.3.1"
+	cfg1.Ring.Ring.InstanceID = "overrides-exporter-1"
+	cfg1.Ring.Ring.InstanceAddr = "1.2.3.1"
 	e1, err := NewOverridesExporter(cfg1, &validation.Limits{}, validation.NewMockTenantLimits(tenantLimits), log.NewNopLogger(), nil)
 	l1 := e1.ring.lifecycler
 	require.NoError(t, err)
@@ -192,8 +212,8 @@ func TestOverridesExporter_withRing(t *testing.T) {
 
 	// Register a second instance.
 	cfg2 := cfg1
-	cfg2.Ring.InstanceID = "overrides-exporter-2"
-	cfg2.Ring.InstanceAddr = "1.2.3.2"
+	cfg2.Ring.Ring.InstanceID = "overrides-exporter-2"
+	cfg2.Ring.Ring.InstanceAddr = "1.2.3.2"
 	e2, err := NewOverridesExporter(cfg2, &validation.Limits{}, validation.NewMockTenantLimits(tenantLimits), log.NewNopLogger(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(ctx, e2))

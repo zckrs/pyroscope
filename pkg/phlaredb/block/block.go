@@ -1,6 +1,7 @@
 package block
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -8,19 +9,24 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/runutil"
 	"github.com/oklog/ulid"
+	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/thanos-io/objstore"
+
+	"github.com/grafana/pyroscope/pkg/util/fnv32"
 )
 
 const (
-	IndexFilename        = "index.tsdb"
-	ParquetSuffix        = ".parquet"
-	DeletionMarkFilename = "deletion-mark.json"
+	IndexFilename = "index.tsdb"
+	ParquetSuffix = ".parquet"
 
 	HostnameLabel = "__hostname__"
 )
@@ -48,6 +54,27 @@ func DownloadMeta(ctx context.Context, logger log.Logger, bkt objstore.Bucket, i
 	return m, nil
 }
 
+// Download downloads directory that is meant to be block directory.
+func Download(ctx context.Context, logger log.Logger, bucket objstore.Bucket, id ulid.ULID, dst string, options ...objstore.DownloadOption) error {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "block.Download", opentracing.Tag{Key: "ULID", Value: id.String()})
+	defer sp.Finish()
+
+	if err := os.MkdirAll(dst, 0o750); err != nil {
+		return errors.Wrap(err, "create dir")
+	}
+
+	if err := objstore.DownloadFile(ctx, logger, bucket, path.Join(id.String(), MetaFilename), filepath.Join(dst, MetaFilename)); err != nil {
+		return err
+	}
+
+	ignoredPaths := []string{MetaFilename}
+	if err := objstore.DownloadDir(ctx, logger, bucket, id.String(), id.String(), dst, append(options, objstore.WithDownloadIgnoredPaths(ignoredPaths...))...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func IsBlockDir(path string) (id ulid.ULID, ok bool) {
 	id, err := ulid.Parse(filepath.Base(path))
 	return id, err == nil
@@ -72,7 +99,7 @@ func upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir st
 		return errors.Wrap(err, "not a block dir")
 	}
 
-	meta, err := ReadFromDir(bdir)
+	meta, err := ReadMetaFromDir(bdir)
 	if err != nil {
 		// No meta or broken meta file.
 		return errors.Wrap(err, "read meta")
@@ -119,7 +146,13 @@ func upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir st
 // Upload uploads a TSDB block to the object storage. It verifies basic
 // features of Thanos block.
 func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir string) error {
-	return upload(ctx, logger, bkt, bdir)
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "block.Upload", opentracing.Tag{Key: "dir", Value: bdir})
+	defer sp.Finish()
+	if err := upload(ctx, logger, bkt, bdir); err != nil {
+		ext.LogError(sp, err)
+		return err
+	}
+	return nil
 }
 
 func cleanUp(logger log.Logger, bkt objstore.Bucket, id ulid.ULID, err error) error {
@@ -129,6 +162,38 @@ func cleanUp(logger log.Logger, bkt objstore.Bucket, id ulid.ULID, err error) er
 		return errors.Wrapf(err, "failed to clean block after upload issue. Partial block in system. Err: %s", err.Error())
 	}
 	return err
+}
+
+// MarkForDeletion creates a file which stores information about when the block was marked for deletion.
+func MarkForDeletion(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID, details string, warnExist bool, markedForDeletion prometheus.Counter) error {
+	deletionMarkFile := path.Join(id.String(), DeletionMarkFilename)
+	deletionMarkExists, err := bkt.Exists(ctx, deletionMarkFile)
+	if err != nil {
+		return errors.Wrapf(err, "check exists %s in bucket", deletionMarkFile)
+	}
+	if deletionMarkExists {
+		if warnExist {
+			level.Warn(logger).Log("msg", "requested to mark for deletion, but file already exists; this should not happen; investigate", "err", errors.Errorf("file %s already exists in bucket", deletionMarkFile))
+		}
+		return nil
+	}
+
+	deletionMark, err := json.Marshal(DeletionMark{
+		ID:           id,
+		DeletionTime: time.Now().Unix(),
+		Version:      DeletionMarkVersion1,
+		Details:      details,
+	})
+	if err != nil {
+		return errors.Wrap(err, "json encode deletion mark")
+	}
+
+	if err := bkt.Upload(ctx, deletionMarkFile, bytes.NewBuffer(deletionMark)); err != nil {
+		return errors.Wrapf(err, "upload file %s to bucket", deletionMarkFile)
+	}
+	markedForDeletion.Inc()
+	level.Info(logger).Log("msg", "block has been marked for deletion", "block", id)
+	return nil
 }
 
 // Delete removes directory that is meant to be block directory.
@@ -197,4 +262,46 @@ func deleteDirRec(ctx context.Context, logger log.Logger, bkt objstore.Bucket, d
 		level.Debug(logger).Log("msg", "deleted file", "file", name, "bucket", bkt.Name())
 		return nil
 	})
+}
+
+// MarkForNoCompact creates a file which marks block to be not compacted.
+func MarkForNoCompact(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID, reason NoCompactReason, details string, markedForNoCompact prometheus.Counter) error {
+	m := path.Join(id.String(), NoCompactMarkFilename)
+	noCompactMarkExists, err := bkt.Exists(ctx, m)
+	if err != nil {
+		return errors.Wrapf(err, "check exists %s in bucket", m)
+	}
+	if noCompactMarkExists {
+		level.Warn(logger).Log("msg", "requested to mark for no compaction, but file already exists; this should not happen; investigate", "err", errors.Errorf("file %s already exists in bucket", m))
+		return nil
+	}
+
+	noCompactMark, err := json.Marshal(NoCompactMark{
+		ID:      id,
+		Version: NoCompactMarkVersion1,
+
+		NoCompactTime: time.Now().Unix(),
+		Reason:        reason,
+		Details:       details,
+	})
+	if err != nil {
+		return errors.Wrap(err, "json encode no compact mark")
+	}
+
+	if err := bkt.Upload(ctx, m, bytes.NewBuffer(noCompactMark)); err != nil {
+		return errors.Wrapf(err, "upload file %s to bucket", m)
+	}
+	markedForNoCompact.Inc()
+	level.Info(logger).Log("msg", "block has been marked for no compaction", "block", id)
+	return nil
+}
+
+// HashBlockID returns a 32-bit hash of the block ID useful for
+// ring-based sharding.
+func HashBlockID(id ulid.ULID) uint32 {
+	h := fnv32.New()
+	for _, b := range id {
+		h = fnv32.AddByte32(h, b)
+	}
+	return h
 }

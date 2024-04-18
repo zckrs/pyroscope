@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/grafana/pyroscope/ebpf/symtab/gosym"
+	"github.com/ianlancetaylor/demangle"
 )
 
 // symbols from .symtab, .dynsym
@@ -43,6 +44,8 @@ type FlatSymbolIndex struct {
 type SymbolTable struct {
 	Index FlatSymbolIndex
 	File  *MMapedElfFile
+
+	demangleOptions []demangle.Option
 }
 
 func (st *SymbolTable) IsDead() bool {
@@ -51,7 +54,7 @@ func (st *SymbolTable) IsDead() bool {
 
 func (st *SymbolTable) DebugInfo() SymTabDebugInfo {
 	return SymTabDebugInfo{
-		Name: "SymbolTable",
+		Name: fmt.Sprintf("SymbolTable %p", st),
 		Size: len(st.Index.Names),
 		File: st.File.fpath,
 	}
@@ -85,13 +88,13 @@ func (st *SymbolTable) Cleanup() {
 	st.File.Close()
 }
 
-func (f *MMapedElfFile) NewSymbolTable() (*SymbolTable, error) {
-	sym, sectionSym, err := f.getSymbols(elf.SHT_SYMTAB)
+func (f *MMapedElfFile) NewSymbolTable(opt *SymbolsOptions) (*SymbolTable, error) {
+	sym, sectionSym, err := f.getSymbols(elf.SHT_SYMTAB, opt)
 	if err != nil && !errors.Is(err, ErrNoSymbols) {
 		return nil, err
 	}
 
-	dynsym, sectionDynSym, err := f.getSymbols(elf.SHT_DYNSYM)
+	dynsym, sectionDynSym, err := f.getSymbols(elf.SHT_DYNSYM, opt)
 	if err != nil && !errors.Is(err, ErrNoSymbols) {
 		return nil, err
 	}
@@ -117,7 +120,10 @@ func (f *MMapedElfFile) NewSymbolTable() (*SymbolTable, error) {
 		},
 		Names:  make([]Name, total),
 		Values: gosym.NewPCIndex(total),
-	}, File: f}
+	},
+		File:            f,
+		demangleOptions: opt.DemangleOptions,
+	}
 	for i := range all {
 		res.Index.Names[i] = all[i].Name
 		res.Index.Values.Set(i, all[i].Value)
@@ -129,7 +135,7 @@ func (st *SymbolTable) symbolName(idx int) (string, error) {
 	linkIndex := st.Index.Names[idx].LinkIndex()
 	SectionHeaderLink := &st.Index.Links[linkIndex]
 	NameIndex := st.Index.Names[idx].NameIndex()
-	s, b := st.File.getString(int(NameIndex) + int(SectionHeaderLink.Offset))
+	s, b := st.File.getString(int(NameIndex)+int(SectionHeaderLink.Offset), st.demangleOptions)
 	if !b {
 		return "", fmt.Errorf("elf getString")
 	}
@@ -137,7 +143,8 @@ func (st *SymbolTable) symbolName(idx int) (string, error) {
 }
 
 type SymTabDebugInfo struct {
-	Name string `river:"name,attr,optional"`
-	Size int    `river:"symbol_count,attr,optional"`
-	File string `river:"file,attr,optional"`
+	Name          string `river:"name,attr,optional"`
+	Size          int    `river:"symbol_count,attr,optional"`
+	File          string `river:"file,attr,optional"`
+	LastUsedRound int    `river:"last_used_round,attr,optional"`
 }

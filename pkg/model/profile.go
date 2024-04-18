@@ -1,18 +1,21 @@
 package model
 
 import (
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
 	"path/filepath"
 	"strings"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/gogo/status"
-	"github.com/google/pprof/profile"
 	"github.com/prometheus/prometheus/model/labels"
 	"google.golang.org/grpc/codes"
 
 	profilev1 "github.com/grafana/pyroscope/api/gen/proto/go/google/v1"
 	ingestv1 "github.com/grafana/pyroscope/api/gen/proto/go/ingester/v1"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
+	"github.com/grafana/pyroscope/pkg/util"
 )
 
 // CompareProfile compares the two profiles.
@@ -50,19 +53,21 @@ func SelectorFromProfileType(profileType *typesv1.ProfileType) *labels.Matcher {
 	}
 }
 
-// SetProfileMetadata sets the metadata on the profile.
-func SetProfileMetadata(p *profile.Profile, ty *typesv1.ProfileType) {
-	p.SampleType = []*profile.ValueType{{Type: ty.SampleType, Unit: ty.SampleUnit}}
-	p.DefaultSampleType = ty.SampleType
-	p.PeriodType = &profile.ValueType{Type: ty.PeriodType, Unit: ty.PeriodUnit}
-	switch ty.Name {
-	case "process_cpu": // todo: this should support other types of cpu profiles
-		p.Period = 1000000000
-	case "memory":
-		p.Period = 512 * 1024
-	default:
-		p.Period = 1
+type SpanSelector map[uint64]struct{}
+
+func NewSpanSelector(spans []string) (SpanSelector, error) {
+	m := make(map[uint64]struct{}, len(spans))
+	b := make([]byte, 8)
+	for _, s := range spans {
+		if len(s) != 16 {
+			return nil, fmt.Errorf("invalid span id length: %q", s)
+		}
+		if _, err := hex.Decode(b, util.YoloBuf(s)); err != nil {
+			return nil, err
+		}
+		m[binary.LittleEndian.Uint64(b)] = struct{}{}
 	}
+	return m, nil
 }
 
 func StacktracePartitionFromProfile(lbls []Labels, p *profilev1.Profile) uint64 {

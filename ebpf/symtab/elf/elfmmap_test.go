@@ -2,11 +2,11 @@ package elf
 
 import (
 	"debug/elf"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 )
 
 func TestElfSymbolComparison(t *testing.T) {
@@ -21,7 +21,7 @@ func TestElfSymbolComparison(t *testing.T) {
 		require.NoError(t, err)
 		defer me.Close()
 
-		tab, _ := me.NewSymbolTable()
+		tab, _ := me.NewSymbolTable(new(SymbolsOptions))
 		if tab == nil {
 			tab = &SymbolTable{}
 		}
@@ -37,11 +37,14 @@ func TestElfSymbolComparison(t *testing.T) {
 			})
 		}
 
-		cmp := func(a, b TestSym) bool {
+		cmp := func(a, b TestSym) int {
 			if a.Start == b.Start {
-				return strings.Compare(a.Name, b.Name) < 0
+				return strings.Compare(a.Name, b.Name)
+			} else if a.Start < b.Start {
+				return -1
+			} else {
+				return 1
 			}
-			return a.Start < b.Start
 		}
 		slices.SortFunc(mySymbols, cmp)
 		slices.SortFunc(genuineSymbols, cmp)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"testing"
 	"time"
 
@@ -20,6 +19,7 @@ import (
 	ingestv1 "github.com/grafana/pyroscope/api/gen/proto/go/ingester/v1"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
 	"github.com/grafana/pyroscope/pkg/iter"
+	phlaremodel "github.com/grafana/pyroscope/pkg/model"
 	"github.com/grafana/pyroscope/pkg/objstore/providers/filesystem"
 	"github.com/grafana/pyroscope/pkg/pprof"
 	pprofth "github.com/grafana/pyroscope/pkg/pprof/testhelper"
@@ -28,37 +28,26 @@ import (
 
 func TestMergeSampleByStacktraces(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		in       func() []*pprofth.ProfileBuilder
-		expected *ingestv1.MergeProfilesStacktracesResult
+		name string
+		in   func() ([]*pprofth.ProfileBuilder, *phlaremodel.Tree)
 	}{
 		{
 			name: "single profile",
-			in: func() (ps []*pprofth.ProfileBuilder) {
+			in: func() (ps []*pprofth.ProfileBuilder, tree *phlaremodel.Tree) {
 				p := pprofth.NewProfileBuilder(int64(15 * time.Second)).CPUProfile()
 				p.ForStacktraceString("my", "other").AddSamples(1)
 				p.ForStacktraceString("my", "other").AddSamples(3)
 				p.ForStacktraceString("my", "other", "stack").AddSamples(3)
 				ps = append(ps, p)
-				return
-			},
-			expected: &ingestv1.MergeProfilesStacktracesResult{
-				Stacktraces: []*ingestv1.StacktraceSample{
-					{
-						FunctionIds: []int32{0, 1},
-						Value:       4,
-					},
-					{
-						FunctionIds: []int32{0, 1, 2},
-						Value:       3,
-					},
-				},
-				FunctionNames: []string{"my", "other", "stack"},
+				tree = new(phlaremodel.Tree)
+				tree.InsertStack(4, "other", "my")
+				tree.InsertStack(3, "stack", "other", "my")
+				return ps, tree
 			},
 		},
 		{
 			name: "multiple profiles",
-			in: func() (ps []*pprofth.ProfileBuilder) {
+			in: func() (ps []*pprofth.ProfileBuilder, tree *phlaremodel.Tree) {
 				for i := 0; i < 3000; i++ {
 					p := pprofth.NewProfileBuilder(int64(15*time.Second)).
 						CPUProfile().WithLabels("series", fmt.Sprintf("%d", i))
@@ -67,25 +56,15 @@ func TestMergeSampleByStacktraces(t *testing.T) {
 					p.ForStacktraceString("my", "other", "stack").AddSamples(3)
 					ps = append(ps, p)
 				}
-				return
-			},
-			expected: &ingestv1.MergeProfilesStacktracesResult{
-				Stacktraces: []*ingestv1.StacktraceSample{
-					{
-						FunctionIds: []int32{0, 1},
-						Value:       12000,
-					},
-					{
-						FunctionIds: []int32{0, 1, 2},
-						Value:       9000,
-					},
-				},
-				FunctionNames: []string{"my", "other", "stack"},
+				tree = new(phlaremodel.Tree)
+				tree.InsertStack(12000, "other", "my")
+				tree.InsertStack(9000, "stack", "other", "my")
+				return ps, tree
 			},
 		},
 		{
 			name: "filtering multiple profiles",
-			in: func() (ps []*pprofth.ProfileBuilder) {
+			in: func() (ps []*pprofth.ProfileBuilder, tree *phlaremodel.Tree) {
 				for i := 0; i < 3000; i++ {
 					p := pprofth.NewProfileBuilder(int64(15*time.Second)).
 						MemoryProfile().WithLabels("series", fmt.Sprintf("%d", i))
@@ -102,44 +81,34 @@ func TestMergeSampleByStacktraces(t *testing.T) {
 					p.ForStacktraceString("my", "other", "stack").AddSamples(3)
 					ps = append(ps, p)
 				}
-				return
-			},
-			expected: &ingestv1.MergeProfilesStacktracesResult{
-				Stacktraces: []*ingestv1.StacktraceSample{
-					{
-						FunctionIds: []int32{0, 1},
-						Value:       12000,
-					},
-					{
-						FunctionIds: []int32{0, 1, 2},
-						Value:       9000,
-					},
-				},
-				FunctionNames: []string{"my", "other", "stack"},
+				tree = new(phlaremodel.Tree)
+				tree.InsertStack(12000, "other", "my")
+				tree.InsertStack(9000, "stack", "other", "my")
+				return ps, tree
 			},
 		},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			testPath := t.TempDir()
-			db, err := New(context.Background(), Config{
-				DataPath:         testPath,
+			ctx := testContext(t)
+			db, err := New(ctx, Config{
+				DataPath:         contextDataDir(ctx),
 				MaxBlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
-			}, NoLimit)
+			}, NoLimit, ctx.localBucketClient)
 			require.NoError(t, err)
-			ctx := context.Background()
 
-			for _, p := range tc.in() {
+			input, expected := tc.in()
+			for _, p := range input {
 				require.NoError(t, db.Ingest(ctx, p.Profile, p.UUID, p.Labels...))
 			}
 
-			require.NoError(t, db.Flush(context.Background()))
+			require.NoError(t, db.Flush(context.Background(), true, ""))
 
-			b, err := filesystem.NewBucket(filepath.Join(testPath, pathLocal))
+			b, err := filesystem.NewBucket(filepath.Join(contextDataDir(ctx), PathLocal))
 			require.NoError(t, err)
 
 			// open resulting block
-			q := NewBlockQuerier(context.Background(), b)
+			q := NewBlockQuerier(ctx, b)
 			require.NoError(t, q.Sync(context.Background()))
 
 			profiles, err := q.queriers[0].SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
@@ -156,52 +125,35 @@ func TestMergeSampleByStacktraces(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			stacktraces, err := q.queriers[0].MergeByStacktraces(ctx, profiles)
+			r, err := q.queriers[0].MergeByStacktraces(ctx, profiles)
 			require.NoError(t, err)
-			sort.Slice(tc.expected.Stacktraces, func(i, j int) bool {
-				return len(tc.expected.Stacktraces[i].FunctionIds) < len(tc.expected.Stacktraces[j].FunctionIds)
-			})
-			sort.Slice(stacktraces.Stacktraces, func(i, j int) bool {
-				return len(stacktraces.Stacktraces[i].FunctionIds) < len(stacktraces.Stacktraces[j].FunctionIds)
-			})
-			testhelper.EqualProto(t, tc.expected, stacktraces)
+			require.Equal(t, expected.String(), r.String())
 		})
 	}
 }
 
 func TestHeadMergeSampleByStacktraces(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		in       func() []*pprofth.ProfileBuilder
-		expected *ingestv1.MergeProfilesStacktracesResult
+		name string
+		in   func() ([]*pprofth.ProfileBuilder, *phlaremodel.Tree)
 	}{
 		{
 			name: "single profile",
-			in: func() (ps []*pprofth.ProfileBuilder) {
+			in: func() (ps []*pprofth.ProfileBuilder, tree *phlaremodel.Tree) {
 				p := pprofth.NewProfileBuilder(int64(15 * time.Second)).CPUProfile()
 				p.ForStacktraceString("my", "other").AddSamples(1)
 				p.ForStacktraceString("my", "other").AddSamples(3)
 				p.ForStacktraceString("my", "other", "stack").AddSamples(3)
 				ps = append(ps, p)
-				return
-			},
-			expected: &ingestv1.MergeProfilesStacktracesResult{
-				Stacktraces: []*ingestv1.StacktraceSample{
-					{
-						FunctionIds: []int32{0, 1},
-						Value:       4,
-					},
-					{
-						FunctionIds: []int32{0, 1, 2},
-						Value:       3,
-					},
-				},
-				FunctionNames: []string{"my", "other", "stack"},
+				tree = new(phlaremodel.Tree)
+				tree.InsertStack(4, "other", "my")
+				tree.InsertStack(3, "stack", "other", "my")
+				return ps, tree
 			},
 		},
 		{
 			name: "multiple profiles",
-			in: func() (ps []*pprofth.ProfileBuilder) {
+			in: func() (ps []*pprofth.ProfileBuilder, tree *phlaremodel.Tree) {
 				for i := 0; i < 3000; i++ {
 					p := pprofth.NewProfileBuilder(int64(15*time.Second)).
 						CPUProfile().WithLabels("series", fmt.Sprintf("%d", i))
@@ -210,25 +162,15 @@ func TestHeadMergeSampleByStacktraces(t *testing.T) {
 					p.ForStacktraceString("my", "other", "stack").AddSamples(3)
 					ps = append(ps, p)
 				}
-				return
-			},
-			expected: &ingestv1.MergeProfilesStacktracesResult{
-				Stacktraces: []*ingestv1.StacktraceSample{
-					{
-						FunctionIds: []int32{0, 1},
-						Value:       12000,
-					},
-					{
-						FunctionIds: []int32{0, 1, 2},
-						Value:       9000,
-					},
-				},
-				FunctionNames: []string{"my", "other", "stack"},
+				tree = new(phlaremodel.Tree)
+				tree.InsertStack(12000, "other", "my")
+				tree.InsertStack(9000, "stack", "other", "my")
+				return ps, tree
 			},
 		},
 		{
 			name: "filtering multiple profiles",
-			in: func() (ps []*pprofth.ProfileBuilder) {
+			in: func() (ps []*pprofth.ProfileBuilder, tree *phlaremodel.Tree) {
 				for i := 0; i < 3000; i++ {
 					p := pprofth.NewProfileBuilder(int64(15*time.Second)).
 						MemoryProfile().WithLabels("series", fmt.Sprintf("%d", i))
@@ -245,37 +187,27 @@ func TestHeadMergeSampleByStacktraces(t *testing.T) {
 					p.ForStacktraceString("my", "other", "stack").AddSamples(3)
 					ps = append(ps, p)
 				}
-				return
-			},
-			expected: &ingestv1.MergeProfilesStacktracesResult{
-				Stacktraces: []*ingestv1.StacktraceSample{
-					{
-						FunctionIds: []int32{0, 1},
-						Value:       12000,
-					},
-					{
-						FunctionIds: []int32{0, 1, 2},
-						Value:       9000,
-					},
-				},
-				FunctionNames: []string{"my", "other", "stack"},
+				tree = new(phlaremodel.Tree)
+				tree.InsertStack(12000, "other", "my")
+				tree.InsertStack(9000, "stack", "other", "my")
+				return ps, tree
 			},
 		},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			testPath := t.TempDir()
-			db, err := New(context.Background(), Config{
-				DataPath:         testPath,
+			ctx := testContext(t)
+			db, err := New(ctx, Config{
+				DataPath:         contextDataDir(ctx),
 				MaxBlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
-			}, NoLimit)
+			}, NoLimit, ctx.localBucketClient)
 			require.NoError(t, err)
-			ctx := context.Background()
 
-			for _, p := range tc.in() {
+			input, expected := tc.in()
+			for _, p := range input {
 				require.NoError(t, db.Ingest(ctx, p.Profile, p.UUID, p.Labels...))
 			}
-			profiles, err := db.head.Queriers().SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
+			profiles, err := db.queriers().SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
 				LabelSelector: `{}`,
 				Type: &typesv1.ProfileType{
 					Name:       "process_cpu",
@@ -288,16 +220,9 @@ func TestHeadMergeSampleByStacktraces(t *testing.T) {
 				End:   int64(model.TimeFromUnixNano(int64(1 * time.Minute))),
 			})
 			require.NoError(t, err)
-			stacktraces, err := db.head.Queriers()[0].MergeByStacktraces(ctx, profiles)
+			r, err := db.queriers()[0].MergeByStacktraces(ctx, profiles)
 			require.NoError(t, err)
-
-			sort.Slice(tc.expected.Stacktraces, func(i, j int) bool {
-				return len(tc.expected.Stacktraces[i].FunctionIds) < len(tc.expected.Stacktraces[j].FunctionIds)
-			})
-			sort.Slice(stacktraces.Stacktraces, func(i, j int) bool {
-				return len(stacktraces.Stacktraces[i].FunctionIds) < len(stacktraces.Stacktraces[j].FunctionIds)
-			})
-			testhelper.EqualProto(t, tc.expected, stacktraces)
+			require.Equal(t, expected.String(), r.String())
 		})
 	}
 }
@@ -381,21 +306,20 @@ func TestMergeSampleByLabels(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			testPath := t.TempDir()
-			db, err := New(context.Background(), Config{
-				DataPath:         testPath,
+			ctx := testContext(t)
+			db, err := New(ctx, Config{
+				DataPath:         contextDataDir(ctx),
 				MaxBlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
-			}, NoLimit)
+			}, NoLimit, ctx.localBucketClient)
 			require.NoError(t, err)
-			ctx := context.Background()
 
 			for _, p := range tc.in() {
 				require.NoError(t, db.Ingest(ctx, p.Profile, p.UUID, p.Labels...))
 			}
 
-			require.NoError(t, db.Flush(context.Background()))
+			require.NoError(t, db.Flush(context.Background(), true, ""))
 
-			b, err := filesystem.NewBucket(filepath.Join(testPath, pathLocal))
+			b, err := filesystem.NewBucket(filepath.Join(contextDataDir(ctx), PathLocal))
 			require.NoError(t, err)
 
 			// open resulting block
@@ -419,7 +343,7 @@ func TestMergeSampleByLabels(t *testing.T) {
 			require.NoError(t, err)
 
 			q.queriers[0].Sort(profiles)
-			series, err := q.queriers[0].MergeByLabels(ctx, iter.NewSliceIterator(profiles), tc.by...)
+			series, err := q.queriers[0].MergeByLabels(ctx, iter.NewSliceIterator(profiles), nil, tc.by...)
 			require.NoError(t, err)
 
 			testhelper.EqualProto(t, tc.expected, series)
@@ -506,19 +430,18 @@ func TestHeadMergeSampleByLabels(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			testPath := t.TempDir()
-			db, err := New(context.Background(), Config{
-				DataPath:         testPath,
+			ctx := testContext(t)
+			db, err := New(ctx, Config{
+				DataPath:         contextDataDir(ctx),
 				MaxBlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
-			}, NoLimit)
+			}, NoLimit, ctx.localBucketClient)
 			require.NoError(t, err)
-			ctx := context.Background()
 
 			for _, p := range tc.in() {
 				require.NoError(t, db.Ingest(ctx, p.Profile, p.UUID, p.Labels...))
 			}
 
-			profileIt, err := db.head.Queriers().SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
+			profileIt, err := db.queriers().SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
 				LabelSelector: `{}`,
 				Type: &typesv1.ProfileType{
 					Name:       "process_cpu",
@@ -534,8 +457,8 @@ func TestHeadMergeSampleByLabels(t *testing.T) {
 			profiles, err := iter.Slice(profileIt)
 			require.NoError(t, err)
 
-			db.head.Sort(profiles)
-			series, err := db.head.Queriers()[0].MergeByLabels(ctx, iter.NewSliceIterator(profiles), tc.by...)
+			db.headQueriers()[0].Sort(profiles)
+			series, err := db.headQueriers()[0].MergeByLabels(ctx, iter.NewSliceIterator(profiles), nil, tc.by...)
 			require.NoError(t, err)
 
 			testhelper.EqualProto(t, tc.expected, series)
@@ -544,13 +467,12 @@ func TestHeadMergeSampleByLabels(t *testing.T) {
 }
 
 func TestMergePprof(t *testing.T) {
-	testPath := t.TempDir()
-	db, err := New(context.Background(), Config{
-		DataPath:         testPath,
+	ctx := testContext(t)
+	db, err := New(ctx, Config{
+		DataPath:         contextDataDir(ctx),
 		MaxBlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
-	}, NoLimit)
+	}, NoLimit, ctx.localBucketClient)
 	require.NoError(t, err)
-	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
 		require.NoError(t, db.Ingest(ctx, generateProfile(t, i*1000), uuid.New(), &typesv1.LabelPair{
@@ -559,9 +481,9 @@ func TestMergePprof(t *testing.T) {
 		}))
 	}
 
-	require.NoError(t, db.Flush(context.Background()))
+	require.NoError(t, db.Flush(context.Background(), true, ""))
 
-	b, err := filesystem.NewBucket(filepath.Join(testPath, pathLocal))
+	b, err := filesystem.NewBucket(filepath.Join(contextDataDir(ctx), PathLocal))
 	require.NoError(t, err)
 
 	// open resulting block
@@ -585,7 +507,7 @@ func TestMergePprof(t *testing.T) {
 	require.NoError(t, err)
 
 	q.queriers[0].Sort(profiles)
-	result, err := q.queriers[0].MergePprof(ctx, iter.NewSliceIterator(profiles))
+	result, err := q.queriers[0].MergePprof(ctx, iter.NewSliceIterator(profiles), 0, nil)
 	require.NoError(t, err)
 
 	data, err := proto.Marshal(generateProfile(t, 1))
@@ -595,17 +517,20 @@ func TestMergePprof(t *testing.T) {
 	for _, sample := range expected.Sample {
 		sample.Value = []int64{sample.Value[0] * 3}
 	}
-	compareProfile(t, expected, result)
+	data, err = proto.Marshal(result)
+	require.NoError(t, err)
+	actual, err := profile.ParseUncompressed(data)
+	require.NoError(t, err)
+	compareProfile(t, expected.Compact(), actual.Compact())
 }
 
 func TestHeadMergePprof(t *testing.T) {
-	testPath := t.TempDir()
-	db, err := New(context.Background(), Config{
-		DataPath:         testPath,
+	ctx := testContext(t)
+	db, err := New(ctx, Config{
+		DataPath:         contextDataDir(ctx),
 		MaxBlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
-	}, NoLimit)
+	}, NoLimit, ctx.localBucketClient)
 	require.NoError(t, err)
-	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
 		require.NoError(t, db.Ingest(ctx, generateProfile(t, i*1000), uuid.New(), &typesv1.LabelPair{
@@ -614,7 +539,7 @@ func TestHeadMergePprof(t *testing.T) {
 		}))
 	}
 
-	profileIt, err := db.head.Queriers().SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
+	profileIt, err := db.queriers().SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
 		LabelSelector: `{}`,
 		Type: &typesv1.ProfileType{
 			Name:       "process_cpu",
@@ -630,8 +555,8 @@ func TestHeadMergePprof(t *testing.T) {
 	profiles, err := iter.Slice(profileIt)
 	require.NoError(t, err)
 
-	db.head.Sort(profiles)
-	result, err := db.head.Queriers()[0].MergePprof(ctx, iter.NewSliceIterator(profiles))
+	db.headQueriers()[0].Sort(profiles)
+	result, err := db.headQueriers()[0].MergePprof(ctx, iter.NewSliceIterator(profiles), 0, nil)
 	require.NoError(t, err)
 
 	data, err := proto.Marshal(generateProfile(t, 1))
@@ -641,13 +566,121 @@ func TestHeadMergePprof(t *testing.T) {
 	for _, sample := range expected.Sample {
 		sample.Value = []int64{sample.Value[0] * 3}
 	}
-	compareProfile(t, expected, result)
+	data, err = proto.Marshal(result)
+	require.NoError(t, err)
+	actual, err := profile.ParseUncompressed(data)
+	require.NoError(t, err)
+	compareProfile(t, expected.Compact(), actual.Compact())
+}
+
+func TestMergeSpans(t *testing.T) {
+	ctx := testContext(t)
+	db, err := New(ctx, Config{
+		DataPath:         contextDataDir(ctx),
+		MaxBlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
+	}, NoLimit, ctx.localBucketClient)
+	require.NoError(t, err)
+
+	require.NoError(t, db.Ingest(ctx, generateProfileWithSpans(t, 1000), uuid.New(), &typesv1.LabelPair{
+		Name:  model.MetricNameLabel,
+		Value: "process_cpu",
+	}))
+
+	require.NoError(t, db.Flush(context.Background(), true, ""))
+
+	b, err := filesystem.NewBucket(filepath.Join(contextDataDir(ctx), PathLocal))
+	require.NoError(t, err)
+
+	// open resulting block
+	q := NewBlockQuerier(context.Background(), b)
+	require.NoError(t, q.Sync(context.Background()))
+
+	profileIt, err := q.queriers[0].SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
+		LabelSelector: `{}`,
+		Type: &typesv1.ProfileType{
+			Name:       "process_cpu",
+			SampleType: "cpu",
+			SampleUnit: "nanoseconds",
+			PeriodType: "cpu",
+			PeriodUnit: "nanoseconds",
+		},
+		Start: int64(model.TimeFromUnixNano(0)),
+		End:   int64(model.TimeFromUnixNano(int64(1 * time.Minute))),
+	})
+	require.NoError(t, err)
+	profiles, err := iter.Slice(profileIt)
+	require.NoError(t, err)
+
+	q.queriers[0].Sort(profiles)
+	spanSelector, err := phlaremodel.NewSpanSelector([]string{"badbadbadbadbadb"})
+	require.NoError(t, err)
+	result, err := q.queriers[0].MergeBySpans(ctx, iter.NewSliceIterator(profiles), spanSelector)
+	require.NoError(t, err)
+
+	expected := new(phlaremodel.Tree)
+	expected.InsertStack(1, "bar", "foo")
+	expected.InsertStack(2, "foo")
+
+	require.Equal(t, expected.String(), result.String())
+}
+
+func TestHeadMergeSpans(t *testing.T) {
+	ctx := testContext(t)
+	db, err := New(ctx, Config{
+		DataPath:         contextDataDir(ctx),
+		MaxBlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
+	}, NoLimit, ctx.localBucketClient)
+	require.NoError(t, err)
+
+	require.NoError(t, db.Ingest(ctx, generateProfileWithSpans(t, 1000), uuid.New(), &typesv1.LabelPair{
+		Name:  model.MetricNameLabel,
+		Value: "process_cpu",
+	}))
+
+	profileIt, err := db.headQueriers().SelectMatchingProfiles(ctx, &ingestv1.SelectProfilesRequest{
+		LabelSelector: `{}`,
+		Type: &typesv1.ProfileType{
+			Name:       "process_cpu",
+			SampleType: "cpu",
+			SampleUnit: "nanoseconds",
+			PeriodType: "cpu",
+			PeriodUnit: "nanoseconds",
+		},
+		Start: int64(model.TimeFromUnixNano(0)),
+		End:   int64(model.TimeFromUnixNano(int64(1 * time.Minute))),
+	})
+	require.NoError(t, err)
+	profiles, err := iter.Slice(profileIt)
+	require.NoError(t, err)
+
+	db.headQueriers()[0].Sort(profiles)
+	spanSelector, err := phlaremodel.NewSpanSelector([]string{"badbadbadbadbadb"})
+	require.NoError(t, err)
+
+	result, err := db.headQueriers()[0].MergeBySpans(ctx, iter.NewSliceIterator(profiles), spanSelector)
+	require.NoError(t, err)
+
+	expected := new(phlaremodel.Tree)
+	expected.InsertStack(1, "bar", "foo")
+	expected.InsertStack(2, "foo")
+
+	require.Equal(t, expected.String(), result.String())
 }
 
 func generateProfile(t *testing.T, ts int) *googlev1.Profile {
 	t.Helper()
 
 	prof, err := pprof.FromProfile(pprofth.FooBarProfile)
+
+	require.NoError(t, err)
+	prof.TimeNanos = int64(ts)
+	return prof
+}
+
+func generateProfileWithSpans(t *testing.T, ts int) *googlev1.Profile {
+	t.Helper()
+
+	prof, err := pprof.FromProfile(pprofth.FooBarProfileWithSpans)
 
 	require.NoError(t, err)
 	prof.TimeNanos = int64(ts)
@@ -691,187 +724,3 @@ func compareProfileSlice[T any](t *testing.T, expected, actual []T) {
 		t.Errorf("result mismatch (-want +got):\n%s", diff)
 	}
 }
-
-// func BenchmarkSelectBlockProfiles(b *testing.B) {
-// 	fs, err := filesystem.NewBucket("./testdata/")
-// 	require.NoError(b, err)
-
-// 	q, err := newSingleBlockQuerier(log.NewLogfmtLogger(os.Stdout), fs, "./testdata/01GD0EKBP0DENYEFVS5SB0K9WG/")
-// 	require.NoError(b, err)
-// 	require.NoError(b, q.open(context.TODO()))
-
-// 	stacktraceAggrValues := map[int64]*ingestv1.StacktraceSample{}
-// 	for i := 0; i < 1000; i++ {
-// 		stacktraceAggrValues[int64(i)] = &ingestv1.StacktraceSample{
-// 			Value: 1,
-// 		}
-// 	}
-// 	b.ResetTimer()
-// 	b.ReportAllocs()
-
-// 	for i := 0; i < b.N; i++ {
-// 		require.NoError(b, err)
-// 		_, err = q.resolveSymbols(context.Background(), stacktraceAggrValues)
-// 		require.NoError(b, err)
-// 	}
-// }
-// func newSingleBlockQuerier(logger log.Logger, bucketReader phlareobjstore.BucketReader, path string) (*singleBlockQuerier, error) {
-// 	meta, _, err := block.MetaFromDir(path)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	q := &singleBlockQuerier{
-// 		logger:       logger,
-// 		bucketReader: phlareobjstore.BucketReaderWithPrefix(bucketReader, meta.ULID.String()),
-// 		meta:         meta,
-// 	}
-// 	q.tables = []tableReader{
-// 		&q.strings,
-// 		&q.functions,
-// 		&q.locations,
-// 		&q.stacktraces,
-// 		&q.profiles,
-// 	}
-// 	return q, nil
-// }
-
-// func TestMergeSampleByProfile(t *testing.T) {
-// 	for _, tc := range []struct {
-// 		name     string
-// 		in       func() []*pprofth.ProfileBuilder
-// 		expected []ProfileValue
-// 	}{
-// 		{
-// 			name: "single profile",
-// 			in: func() (ps []*pprofth.ProfileBuilder) {
-// 				p := pprofth.NewProfileBuilder(int64(15*time.Second)).CPUProfile().
-// 					WithLabels("instance", "bar")
-// 				p.ForStacktraceString("my", "other").AddSamples(1)
-// 				p.ForStacktraceString("my", "other").AddSamples(3)
-// 				p.ForStacktraceString("my", "other", "stack").AddSamples(3)
-// 				ps = append(ps, p)
-// 				return
-// 			},
-// 			expected: []ProfileValue{
-// 				{
-// 					Profile: Profile{
-// 						Labels:    phlaremodel.LabelsFromStrings("job", "foo", "instance", "bar"),
-// 						Timestamp: model.TimeFromUnixNano(int64(15 * time.Second)),
-// 					},
-// 					Value: 7,
-// 				},
-// 			},
-// 		},
-// 		{
-// 			name: "multiple profiles",
-// 			in: func() (ps []*pprofth.ProfileBuilder) {
-// 				for i := 0; i < 3000; i++ {
-// 					p := pprofth.NewProfileBuilder(int64(15*time.Second)).
-// 						CPUProfile().WithLabels("series", fmt.Sprintf("%d", i))
-// 					p.ForStacktraceString("my", "other").AddSamples(1)
-// 					p.ForStacktraceString("my", "other").AddSamples(3)
-// 					p.ForStacktraceString("my", "other", "stack").AddSamples(3)
-// 					ps = append(ps, p)
-// 				}
-// 				return
-// 			},
-// 			expected: generateProfileValues(3000, 7),
-// 		},
-// 		{
-// 			name: "filtering multiple profiles",
-// 			in: func() (ps []*pprofth.ProfileBuilder) {
-// 				for i := 0; i < 3000; i++ {
-// 					p := pprofth.NewProfileBuilder(int64(15*time.Second)).
-// 						MemoryProfile().WithLabels("series", fmt.Sprintf("%d", i))
-// 					p.ForStacktraceString("my", "other").AddSamples(1, 2, 3, 4)
-// 					p.ForStacktraceString("my", "other").AddSamples(3, 2, 3, 4)
-// 					p.ForStacktraceString("my", "other", "stack").AddSamples(3, 3, 3, 3)
-// 					ps = append(ps, p)
-// 				}
-// 				for i := 0; i < 3000; i++ {
-// 					p := pprofth.NewProfileBuilder(int64(15*time.Second)).
-// 						CPUProfile().WithLabels("series", fmt.Sprintf("%d", i))
-// 					p.ForStacktraceString("my", "other").AddSamples(1)
-// 					p.ForStacktraceString("my", "other").AddSamples(3)
-// 					p.ForStacktraceString("my", "other", "stack").AddSamples(3)
-// 					ps = append(ps, p)
-// 				}
-// 				return
-// 			},
-// 			expected: generateProfileValues(3000, 7),
-// 		},
-// 	} {
-// 		tc := tc
-// 		t.Run(tc.name, func(t *testing.T) {
-// 			testPath := t.TempDir()
-// 			db, err := New(&Config{
-// 				DataPath:      testPath,
-// 				BlockDuration: time.Duration(100000) * time.Minute, // we will manually flush
-// 			}, log.NewNopLogger(), nil)
-// 			require.NoError(t, err)
-// 			ctx := context.Background()
-
-// 			for _, p := range tc.in() {
-// 				require.NoError(t, db.Ingest(ctx, p.Profile, p.UUID, p.Labels...))
-// 			}
-
-// 			require.NoError(t, db.Flush(context.Background()))
-
-// 			b, err := filesystem.NewBucket(filepath.Join(testPath, pathLocal))
-// 			require.NoError(t, err)
-
-// 			// open resulting block
-// 			q := NewBlockQuerier(log.NewNopLogger(), b)
-// 			require.NoError(t, q.Sync(context.Background()))
-
-// 			merger, err := q.queriers[0].SelectMerge(ctx, SelectMergeRequest{
-// 				LabelSelector: `{}`,
-// 				Type: &typesv1.ProfileType{
-// 					Name:       "process_cpu",
-// 					SampleType: "cpu",
-// 					SampleUnit: "nanoseconds",
-// 					PeriodType: "cpu",
-// 					PeriodUnit: "nanoseconds",
-// 				},
-// 				Start: model.TimeFromUnixNano(0),
-// 				End:   model.TimeFromUnixNano(int64(1 * time.Minute)),
-// 			})
-// 			require.NoError(t, err)
-// 			profiles := merger.SelectedProfiles()
-// 			it, err := merger.MergeByProfile(profiles)
-// 			require.NoError(t, err)
-
-// 			actual := []ProfileValue{}
-// 			for it.Next() {
-// 				val := it.At()
-// 				val.Labels = val.Labels.WithoutPrivateLabels()
-// 				actual = append(actual, val)
-// 			}
-// 			require.NoError(t, it.Err())
-// 			require.NoError(t, it.Close())
-// 			for i := range actual {
-// 				actual[i].Profile.RowNum = 0
-// 				actual[i].Profile.Fingerprint = 0
-// 			}
-
-// 			testhelper.EqualProto(t, tc.expected, actual)
-// 		})
-// 	}
-// }
-
-// func generateProfileValues(count int, value int64) (result []ProfileValue) {
-// 	for i := 0; i < count; i++ {
-// 		result = append(result, ProfileValue{
-// 			Profile: Profile{
-// 				Labels:    phlaremodel.LabelsFromStrings("job", "foo", "series", fmt.Sprintf("%d", i)),
-// 				Timestamp: model.TimeFromUnixNano(int64(15 * time.Second)),
-// 			},
-// 			Value: value,
-// 		})
-// 	}
-// 	// profiles are store by labels then timestamp.
-// 	sort.Slice(result, func(i, j int) bool {
-// 		return phlaremodel.CompareLabelPairs(result[i].Labels, result[j].Labels) < 0
-// 	})
-// 	return
-// }

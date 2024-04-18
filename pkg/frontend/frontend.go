@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/flagext"
@@ -34,6 +34,7 @@ import (
 	"github.com/grafana/pyroscope/pkg/scheduler/schedulerdiscovery"
 	"github.com/grafana/pyroscope/pkg/util/httpgrpc"
 	"github.com/grafana/pyroscope/pkg/util/httpgrpcutil"
+	"github.com/grafana/pyroscope/pkg/validation"
 )
 
 // Config for a Frontend.
@@ -98,6 +99,7 @@ type Limits interface {
 	MaxQueryParallelism(string) int
 	MaxQueryLength(tenantID string) time.Duration
 	MaxQueryLookback(tenantID string) time.Duration
+	validation.FlameGraphLimits
 }
 
 type frontendRequest struct {
@@ -292,7 +294,7 @@ func (f *Frontend) QueryResult(ctx context.Context, r *connect.Request[frontendp
 		case req.response <- qrReq:
 			// Should always be possible, unless QueryResult is called multiple times with the same queryID.
 		default:
-			level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "user", userID)
+			level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "tenant", userID)
 		}
 	}
 

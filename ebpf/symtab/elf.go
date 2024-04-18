@@ -9,7 +9,9 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/pyroscope/ebpf/metrics"
 	elf2 "github.com/grafana/pyroscope/ebpf/symtab/elf"
+	"github.com/ianlancetaylor/demangle"
 )
 
 var (
@@ -30,13 +32,29 @@ type ElfTable struct {
 	logger  log.Logger
 	procMap *ProcMap
 }
+type SymbolOptions struct {
+	GoTableFallback    bool
+	PythonFullFilePath bool
+	DemangleOptions    []demangle.Option
+}
+
+var DefaultSymbolOptions = &SymbolOptions{
+	GoTableFallback: false,
+}
 
 type ElfTableOptions struct {
-	ElfCache *ElfCache
-	Metrics  *Metrics // may be nil for tests
+	ElfCache      *ElfCache
+	Metrics       *metrics.SymtabMetrics
+	SymbolOptions *SymbolOptions
 }
 
 func NewElfTable(logger log.Logger, procMap *ProcMap, fs string, elfFilePath string, options ElfTableOptions) *ElfTable {
+	if options.SymbolOptions == nil {
+		options.SymbolOptions = DefaultSymbolOptions
+	}
+	if options.Metrics == nil {
+		panic("metrics is nil")
+	}
 	res := &ElfTable{
 		procMap:     procMap,
 		fs:          fs,
@@ -60,6 +78,12 @@ func (et *ElfTable) findBase(e *elf2.MMapedElfFile) bool {
 				et.base = m.StartAddr - prog.Vaddr
 				return true
 			}
+			alignedProgOffset := uint64(prog.Off) & 0xfffffffffffff000
+			if uint64(m.Offset) == alignedProgOffset {
+				d := prog.Off - alignedProgOffset
+				et.base = m.StartAddr + d - prog.Vaddr
+				return true
+			}
 		}
 	}
 	return false
@@ -74,21 +98,18 @@ func (et *ElfTable) load() {
 
 	me, err := elf2.NewMMapedElfFile(fsElfFilePath)
 	if err != nil {
-		et.err = err
-		et.onLoadError()
+		et.onLoadError(err)
 		return
 	}
 	defer me.Close() // todo do not close if it is the selected elf
 
 	if !et.findBase(me) {
-		et.err = errElfBaseNotFound
+		et.onLoadError(errElfBaseNotFound)
 		return
 	}
 	buildID, err := me.BuildID()
-	if err != nil && !errors.Is(err, elf2.ErrNoBuildIDSection) {
-		et.err = err
-		et.onLoadError()
-		return
+	if err != nil {
+		level.Error(et.logger).Log("msg", "failed to get build id", "err", err, "f", et.elfFilePath, "fs", et.fs)
 	}
 
 	symbols := et.options.ElfCache.GetSymbolsByBuildID(buildID)
@@ -99,8 +120,7 @@ func (et *ElfTable) load() {
 	}
 	fileInfo, err := os.Stat(fsElfFilePath)
 	if err != nil {
-		et.err = err
-		et.onLoadError()
+		et.onLoadError(err)
 		return
 	}
 	symbols = et.options.ElfCache.GetSymbolsByStat(statFromFileInfo(fileInfo))
@@ -114,16 +134,14 @@ func (et *ElfTable) load() {
 	if debugFilePath != "" {
 		debugMe, err := elf2.NewMMapedElfFile(path.Join(et.fs, debugFilePath))
 		if err != nil {
-			et.err = err
-			et.onLoadError()
+			et.onLoadError(err)
 			return
 		}
 		defer debugMe.Close() // todo do not close if it is the selected elf
 
 		symbols, err = et.createSymbolTable(debugMe)
 		if err != nil {
-			et.err = err
-			et.onLoadError()
+			et.onLoadError(err)
 			return
 		}
 		et.table = symbols
@@ -132,10 +150,8 @@ func (et *ElfTable) load() {
 	}
 
 	symbols, err = et.createSymbolTable(me)
-	level.Debug(et.logger).Log("msg", "create symbol table", "f", me.FilePath())
 	if err != nil {
-		et.err = err
-		et.onLoadError()
+		et.onLoadError(err)
 		return
 	}
 
@@ -148,8 +164,19 @@ func (et *ElfTable) load() {
 }
 
 func (et *ElfTable) createSymbolTable(me *elf2.MMapedElfFile) (SymbolNameResolver, error) {
-	symTable, symErr := me.NewSymbolTable()
+	level.Debug(et.logger).Log("msg", "create symbol table", "path", me.FilePath())
 	goTable, goErr := me.NewGoTable()
+	if !et.options.SymbolOptions.GoTableFallback && goErr == nil {
+		return goTable, nil
+	}
+	symbolOptions := elf2.SymbolsOptions{
+		DemangleOptions: et.options.SymbolOptions.DemangleOptions,
+	}
+	if goErr == nil && goTable.Index.Entry.Length() > 0 {
+		symbolOptions.FilterFrom = goTable.Index.Entry.Get(0)
+		symbolOptions.FilterTo = goTable.Index.End
+	}
+	symTable, symErr := me.NewSymbolTable(&symbolOptions)
 	if symErr != nil && goErr != nil {
 		return nil, fmt.Errorf("s: %s g: %s", symErr.Error(), goErr.Error())
 	}
@@ -298,8 +325,17 @@ func (et *ElfTable) DebugInfo() elf2.SymTabDebugInfo {
 	return et.table.DebugInfo()
 }
 
-func (et *ElfTable) onLoadError() {
-	level.Error(et.logger).Log("msg", "failed to load elf table", "err", et.err,
+func (et *ElfTable) onLoadError(err error) {
+	et.err = err
+	var l log.Logger
+	if errors.Is(err, os.ErrNotExist) {
+		l = level.Debug(et.logger)
+	} else {
+		l = level.Error(et.logger)
+	}
+	l.Log(
+		"msg", "failed to load elf table",
+		"err", et.err,
 		"f", et.elfFilePath,
 		"fs", et.fs)
 	if et.options.Metrics != nil {
@@ -319,6 +355,9 @@ func errorType(err error) string {
 	}
 	if errors.Is(err, os.ErrInvalid) {
 		return "ErrInvalid"
+	}
+	if errors.Is(err, errElfBaseNotFound) {
+		return "ElfBaseNotFound"
 	}
 	return "Other"
 }

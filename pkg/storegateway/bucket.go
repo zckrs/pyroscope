@@ -11,11 +11,10 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/mimir/pkg/storegateway"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/samber/lo"
 
 	phlareobj "github.com/grafana/pyroscope/pkg/objstore"
 	"github.com/grafana/pyroscope/pkg/phlaredb"
@@ -25,8 +24,15 @@ import (
 // TODO move this to a config.
 const blockSyncConcurrency = 100
 
+type BucketStoreStats struct {
+	// BlocksLoaded is the number of blocks currently loaded in the bucket store.
+	BlocksLoaded int
+}
+
 type BucketStore struct {
-	bucket            phlareobj.Bucket
+	bucket  phlareobj.Bucket
+	fetcher block.MetadataFetcher
+
 	tenantID, syncDir string
 
 	logger log.Logger
@@ -35,21 +41,23 @@ type BucketStore struct {
 	blocks   map[ulid.ULID]*Block
 	blockSet *bucketBlockSet
 
-	filters []BlockMetaFilter
 	metrics *Metrics
-	stats   storegateway.BucketStoreStats
+	stats   BucketStoreStats
 }
 
-func NewBucketStore(bucket phlareobj.Bucket, tenantID string, syncDir string, filters []BlockMetaFilter, logger log.Logger, Metrics *Metrics) (*BucketStore, error) {
+func NewBucketStore(bucket phlareobj.Bucket, fetcher block.MetadataFetcher, tenantID string, syncDir string, logger log.Logger, reg prometheus.Registerer) (*BucketStore, error) {
 	s := &BucketStore{
-		bucket:   phlareobj.NewPrefixedBucket(bucket, tenantID+"/phlaredb"),
+		fetcher:  fetcher,
+		bucket:   phlareobj.NewTenantBucketClient(tenantID, bucket, nil),
 		tenantID: tenantID,
 		syncDir:  syncDir,
-		logger:   logger,
-		filters:  filters,
+		logger:   log.With(logger, "tenant", tenantID),
 		blockSet: newBucketBlockSet(),
 		blocks:   map[ulid.ULID]*Block{},
-		metrics:  Metrics,
+		metrics: NewBucketStoreMetrics(prometheus.WrapRegistererWith(
+			prometheus.Labels{"tenant": tenantID},
+			reg,
+		)),
 	}
 
 	if err := os.MkdirAll(syncDir, 0o750); err != nil {
@@ -96,7 +104,8 @@ func (s *BucketStore) getBlock(id ulid.ULID) *Block {
 }
 
 func (s *BucketStore) SyncBlocks(ctx context.Context) error {
-	metas, metaFetchErr := s.fetchBlocksMeta(ctx)
+	// TODO sounds like we should get the meta this is just a list of ids
+	metas, _, metaFetchErr := s.fetcher.Fetch(ctx)
 	// For partial view allow adding new blocks at least.
 	if metaFetchErr != nil && metas == nil {
 		return metaFetchErr
@@ -171,6 +180,7 @@ func (bs *BucketStore) addBlock(ctx context.Context, meta *block.Meta) (err erro
 	b, err := func() (*Block, error) {
 		bs.blocksMx.Lock()
 		defer bs.blocksMx.Unlock()
+		ctx = phlaredb.ContextWithBlockMetrics(ctx, bs.metrics.blockMetrics)
 		b, err := bs.createBlock(ctx, meta)
 		if err != nil {
 			return nil, errors.Wrap(err, "load block from disk")
@@ -202,7 +212,7 @@ func (bs *BucketStore) addBlock(ctx context.Context, meta *block.Meta) (err erro
 	return nil
 }
 
-func (b *BucketStore) Stats() storegateway.BucketStoreStats {
+func (b *BucketStore) Stats() BucketStoreStats {
 	return b.stats
 }
 
@@ -248,46 +258,6 @@ func (s *BucketStore) RemoveBlocksAndClose() error {
 		return errors.Wrap(err, "delete block")
 	}
 	return nil
-}
-
-func (s *BucketStore) fetchBlocksMeta(ctx context.Context) (map[ulid.ULID]*block.Meta, error) {
-	var (
-		to   = time.Now()
-		from = to.Add(-time.Hour * 24 * 31) // todo make this configurable
-	)
-
-	var (
-		metas []*block.Meta
-		mtx   sync.Mutex
-	)
-
-	start := time.Now()
-	level.Debug(s.logger).Log("msg", "fetching blocks meta", "from", from, "to", to)
-	defer func() {
-		level.Debug(s.logger).Log("msg", "fetched blocks meta", "total", len(metas), "elapsed", time.Since(start))
-	}()
-	if err := block.IterBlockMetas(ctx, s.bucket, from, to, func(m *block.Meta) {
-		mtx.Lock()
-		defer mtx.Unlock()
-		metas = append(metas, m)
-	}); err != nil {
-		return nil, errors.Wrap(err, "iter block metas")
-	}
-
-	metaMap := lo.SliceToMap(metas, func(item *block.Meta) (ulid.ULID, *block.Meta) {
-		return item.ULID, item
-	})
-	if len(metaMap) == 0 {
-		return nil, nil
-	}
-	for _, filter := range s.filters {
-		// NOTE: filter can update synced metric accordingly to the reason of the exclude.
-		// todo: wire up the filter with the metrics.
-		if err := filter.Filter(ctx, metaMap, s.metrics.Synced); err != nil {
-			return nil, errors.Wrap(err, "filter metas")
-		}
-	}
-	return metaMap, nil
 }
 
 // bucketBlockSet holds all blocks.
