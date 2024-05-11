@@ -48,7 +48,7 @@ func NewFileFinder(client VCSClient, repo giturl.IGitURL, path, ref string, http
 // Find returns the file content and URL.
 func (ff FileFinder) Find(ctx context.Context) (*vcsv1.GetFileResponse, error) {
 	switch filepath.Ext(ff.path) {
-	case ExtGo:
+	case extGo:
 		return ff.findGoFile(ctx)
 	// todo: add more languages support
 	default:

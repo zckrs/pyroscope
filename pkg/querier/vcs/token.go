@@ -69,6 +69,11 @@ func tokenFromRequest(req connect.AnyRequest) (*oauth2.Token, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if time.Now().After(token.Expiry) {
+		return nil, fmt.Errorf("token is expired")
+	}
+
 	return token, nil
 }
 

@@ -17,10 +17,6 @@ import (
 	"github.com/grafana/pyroscope/pkg/querier/vcs/source/golang"
 )
 
-const (
-	ExtGo = ".go"
-)
-
 // findGoFile finds a go file in a vcs repository.
 func (ff FileFinder) findGoFile(ctx context.Context) (*vcsv1.GetFileResponse, error) {
 	if url, ok := golang.StandardLibraryURL(ff.path); ok {
