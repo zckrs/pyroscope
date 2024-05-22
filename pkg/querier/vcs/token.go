@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -20,15 +19,9 @@ import (
 )
 
 const (
-	sessionCookieName = "GitSession"
+	sessionCookieName         = "GitSession"
+	envVarGithubSessionSecret = "GITHUB_SESSION_SECRET"
 )
-
-type gitSessionTokenCookie struct {
-	Metadata        string `json:"metadata"`
-	ExpiryTimestamp int64  `json:"expiry"`
-}
-
-const envVarGithubSessionSecret = "GITHUB_SESSION_SECRET"
 
 var githubSessionSecret = []byte(os.Getenv(envVarGithubSessionSecret))
 
@@ -47,7 +40,7 @@ func deriveEncryptionKeyForContext(ctx context.Context) ([]byte, error) {
 	}
 	h := sha256.New()
 	h.Write(githubSessionSecret)
-	h.Write([]byte{':'})
+	h.Write([]byte(":"))
 	h.Write([]byte(tenantID))
 	return h.Sum(nil), nil
 }
@@ -103,56 +96,24 @@ func tokenFromRequest(ctx context.Context, req connect.AnyRequest) (*oauth2.Toke
 }
 
 // encodeToken encrypts then base64 encodes an OAuth token.
-func encodeToken(token *oauth2.Token, key []byte) (*http.Cookie, error) {
+func encodeToken(token *oauth2.Token, key []byte) (string, error) {
 	encrypted, err := encryptToken(token, key)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	bytes, err := json.Marshal(gitSessionTokenCookie{
-		Metadata:        encrypted,
-		ExpiryTimestamp: token.Expiry.UnixMilli(),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	encoded := base64.StdEncoding.EncodeToString(bytes)
-	cookie := &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    encoded,
-		Expires:  time.Now().Add(githubRefreshExpiryDuration),
-		HttpOnly: false,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-	}
-	return cookie, nil
+	encoded := base64.StdEncoding.EncodeToString(encrypted)
+	return encoded, nil
 }
 
 // decodeToken base64 decodes and decrypts a OAuth token.
 func decodeToken(value string, key []byte) (*oauth2.Token, error) {
-	var token *oauth2.Token
-
 	decoded, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
 		return nil, err
 	}
 
-	sessionToken := gitSessionTokenCookie{}
-	err = json.Unmarshal(decoded, &sessionToken)
-	if err != nil {
-		// This may be a legacy cookie. Legacy cookies aren't base64 encoded
-		// JSON objects, but rather a base64 encoded crypto hash.
-		var innerErr error
-		token, innerErr = decryptToken(value, key)
-		if innerErr != nil {
-			// Legacy fallback failed, return the original error.
-			return nil, err
-		}
-		return token, nil
-	}
-
-	token, err = decryptToken(sessionToken.Metadata, key)
+	token, err := decryptToken(decoded, key)
 	if err != nil {
 		return nil, err
 	}

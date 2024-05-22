@@ -68,7 +68,11 @@ func (q *Service) GithubLogin(ctx context.Context, req *connect.Request[vcsv1.Gi
 	}
 
 	res := &vcsv1.GithubLoginResponse{
-		Cookie: cookie.String(),
+		Token: &vcsv1.GithubToken{
+			Metadata:      cookie,
+			TokenExpiry:   token.Expiry.UnixMilli(),
+			RefreshExpiry: time.Now().Add(githubRefreshExpiryDuration).UnixMilli(),
+		},
 	}
 	return connect.NewResponse(res), nil
 }
@@ -100,14 +104,18 @@ func (q *Service) GithubRefresh(ctx context.Context, req *connect.Request[vcsv1.
 		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("failed to process token"))
 	}
 
-	cookie, err := encodeToken(newToken, derivedKey)
+	encodedToken, err := encodeToken(newToken, derivedKey)
 	if err != nil {
 		q.logger.Log("err", err, "msg", "failed to encode GitHub OAuth token")
 		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("failed to refresh token"))
 	}
 
 	res := &vcsv1.GithubRefreshResponse{
-		Cookie: cookie.String(),
+		Token: &vcsv1.GithubToken{
+			Metadata:      encodedToken,
+			TokenExpiry:   token.Expiry.UnixMilli(),
+			RefreshExpiry: time.Now().Add(githubRefreshExpiryDuration).UnixMilli(),
+		},
 	}
 	return connect.NewResponse(res), nil
 }

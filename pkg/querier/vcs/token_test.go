@@ -2,8 +2,7 @@ package vcs
 
 import (
 	"context"
-	"encoding/base64"
-	"net/http"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -152,7 +151,7 @@ func Test_tokenFromRequest(t *testing.T) {
 
 		// The type of request here doesn't matter.
 		req := connect.NewRequest(&vcsv1.GetFileRequest{})
-		req.Header().Add("Cookie", testEncodeCookie(t, derivedKey, wantToken).String())
+		req.Header().Add("Cookie", testCookieHeader(t, derivedKey, wantToken))
 
 		gotToken, err := tokenFromRequest(ctx, req)
 		require.NoError(t, err)
@@ -174,9 +173,8 @@ func Test_tokenFromRequest(t *testing.T) {
 
 func Test_encodeToken(t *testing.T) {
 	githubSessionSecret = []byte("16_byte_key_XXXX")
-	ctx := newTestContext()
 
-	derivedKey, err := deriveEncryptionKeyForContext(ctx)
+	derivedKey, err := deriveEncryptionKeyForContext(newTestContext())
 	require.NoError(t, err)
 
 	token := &oauth2.Token{
@@ -186,13 +184,12 @@ func Test_encodeToken(t *testing.T) {
 		Expiry:       time.Unix(1713298947, 0).UTC(), // 2024-04-16T20:22:27.346Z
 	}
 
-	got, err := encodeToken(token, derivedKey)
+	encoded, err := encodeToken(token, derivedKey)
 	require.NoError(t, err)
-	require.Equal(t, sessionCookieName, got.Name)
-	require.NotEmpty(t, got.Value)
-	require.NotZero(t, got.Expires)
-	require.True(t, got.Secure)
-	require.Equal(t, http.SameSiteLaxMode, got.SameSite)
+
+	got, err := decodeToken(encoded, derivedKey)
+	require.NoError(t, err)
+	require.Equal(t, token, got)
 }
 
 func Test_decodeToken(t *testing.T) {
@@ -209,23 +206,9 @@ func Test_decodeToken(t *testing.T) {
 			RefreshToken: "my_refresh_token",
 			Expiry:       time.Unix(1713298947, 0).UTC(), // 2024-04-16T20:22:27.346Z
 		}
-		cookie := testEncodeCookie(t, derivedKey, want)
+		encodedToken := testEncodeToken(t, derivedKey, want)
 
-		got, err := decodeToken(cookie.Value, derivedKey)
-		require.NoError(t, err)
-		require.Equal(t, want, got)
-	})
-
-	t.Run("valid legacy token", func(t *testing.T) {
-		want := &oauth2.Token{
-			AccessToken:  "my_access_token",
-			TokenType:    "my_token_type",
-			RefreshToken: "my_refresh_token",
-			Expiry:       time.Unix(1713298947, 0).UTC(), // 2024-04-16T20:22:27.346Z
-		}
-		cookie := testEncodeLegacyCookie(t, derivedKey, want)
-
-		got, err := decodeToken(cookie.Value, derivedKey)
+		got, err := decodeToken(encodedToken, derivedKey)
 		require.NoError(t, err)
 		require.Equal(t, want, got)
 	})
@@ -237,14 +220,6 @@ func Test_decodeToken(t *testing.T) {
 		require.Error(t, err)
 		require.EqualError(t, err, "illegal base64 data at input byte 4")
 	})
-
-	t.Run("invalid json encoding", func(t *testing.T) {
-		illegalJSON := base64.StdEncoding.EncodeToString([]byte("illegal json value"))
-
-		_, err := decodeToken(illegalJSON, derivedKey)
-		require.Error(t, err)
-		require.EqualError(t, err, "invalid character 'i' looking for beginning of value")
-	})
 }
 
 func Test_tenantIsolation(t *testing.T) {
@@ -255,16 +230,14 @@ func Test_tenantIsolation(t *testing.T) {
 		ctxB = newTestContextWithTenantID("tenant_b")
 	)
 
+	encodedTokenA := &oauth2.Token{
+		AccessToken: "so_secret",
+	}
 	derivedKeyA, err := deriveEncryptionKeyForContext(ctxA)
 	require.NoError(t, err)
 
-	encodedTokenA, err := encodeToken(&oauth2.Token{
-		AccessToken: "so_secret",
-	}, derivedKeyA)
-	require.NoError(t, err)
-
 	req := connect.NewRequest(&vcsv1.GetFileRequest{})
-	req.Header().Add("Cookie", encodedTokenA.String())
+	req.Header().Add("Cookie", testCookieHeader(t, derivedKeyA, encodedTokenA))
 
 	tA, err := tokenFromRequest(ctxA, req)
 	require.NoError(t, err)
@@ -275,12 +248,13 @@ func Test_tenantIsolation(t *testing.T) {
 
 }
 
-func Test_StillCompatbile(t *testing.T) {
+func Test_StillCompatible(t *testing.T) {
 	githubSessionSecret = []byte("16_byte_key_XXXX")
 
 	ctx := newTestContextWithTenantID("tenant_a")
 	req := connect.NewRequest(&vcsv1.GetFileRequest{})
-	req.Header().Add("Cookie", "GitSession=eyJtZXRhZGF0YSI6Im12N0d1OHlIanZxdWdQMmF5TnJaYXd1SXNyQXFmUUVIMVhGS1RkejVlZWtob1NRV1JUM3hVZGRuMndUemhQZ05oWktRVkpjcVh5SVJDSnFmTTV3WTJyNmR3R21rZkRhL2FORjhRZ0lJcU1oa1hPbGFEdXNwcFE9PSJ9Cg==")
+	// req.Header().Add("Cookie", "GitSession=eyJtZXRhZGF0YSI6Im12N0d1OHlIanZxdWdQMmF5TnJaYXd1SXNyQXFmUUVIMVhGS1RkejVlZWtob1NRV1JUM3hVZGRuMndUemhQZ05oWktRVkpjcVh5SVJDSnFmTTV3WTJyNmR3R21rZkRhL2FORjhRZ0lJcU1oa1hPbGFEdXNwcFE9PSJ9Cg==")
+	req.Header().Add("Cookie", "GitSession=mv7Gu8yHjvqugP2ayNrZawuIsrAqfQEH1XFKTdz5eekhoSQWRT3xUddn2wTzhPgNhZKQVJcqXyIRCJqfM5wY2r6dwGmkfDa/aNF8QgIIqMhkXOlaDusppQ==")
 
 	realToken, err := tokenFromRequest(ctx, req)
 	require.NoError(t, err)
@@ -295,7 +269,7 @@ func newTestContextWithTenantID(tenantID string) context.Context {
 	return tenant.InjectTenantID(context.Background(), tenantID)
 }
 
-func testEncodeCookie(t *testing.T, key []byte, token *oauth2.Token) *http.Cookie {
+func testEncodeToken(t *testing.T, key []byte, token *oauth2.Token) string {
 	t.Helper()
 
 	encoded, err := encodeToken(token, key)
@@ -304,18 +278,11 @@ func testEncodeCookie(t *testing.T, key []byte, token *oauth2.Token) *http.Cooki
 	return encoded
 }
 
-func testEncodeLegacyCookie(t *testing.T, key []byte, token *oauth2.Token) *http.Cookie {
+func testCookieHeader(t *testing.T, key []byte, token *oauth2.Token) string {
 	t.Helper()
 
-	encrypted, err := encryptToken(token, key)
+	encoded, err := encodeToken(token, key)
 	require.NoError(t, err)
 
-	return &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    encrypted,
-		Expires:  token.Expiry,
-		HttpOnly: false,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-	}
+	return fmt.Sprintf("%s=%s", sessionCookieName, encoded)
 }

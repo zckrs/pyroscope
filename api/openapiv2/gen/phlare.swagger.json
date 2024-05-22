@@ -813,16 +813,32 @@
     "v1GithubLoginResponse": {
       "type": "object",
       "properties": {
-        "cookie": {
-          "type": "string"
+        "token": {
+          "$ref": "#/definitions/v1GithubToken"
         }
       }
     },
     "v1GithubRefreshResponse": {
       "type": "object",
       "properties": {
-        "cookie": {
+        "token": {
+          "$ref": "#/definitions/v1GithubToken"
+        }
+      }
+    },
+    "v1GithubToken": {
+      "type": "object",
+      "properties": {
+        "metadata": {
           "type": "string"
+        },
+        "tokenExpiry": {
+          "type": "string",
+          "format": "int64"
+        },
+        "refreshExpiry": {
+          "type": "string",
+          "format": "int64"
         }
       }
     },

@@ -1,7 +1,6 @@
 package vcs
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 
@@ -11,29 +10,26 @@ import (
 
 const gcmNonceSize = 12
 
-func encryptToken(token *oauth2.Token, key []byte) (string, error) {
+func encryptToken(token *oauth2.Token, key []byte) ([]byte, error) {
 	cipher, err := encryption.NewGCMCipher(key)
-	if err != nil {
-		return "", err
-	}
-	textBytes, err := json.Marshal(token)
-	if err != nil {
-		return "", err
-	}
-	enc, err := cipher.Encrypt(textBytes)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(enc), nil
-}
-
-func decryptToken(encodedText string, key []byte) (*oauth2.Token, error) {
-	encryptedData, err := base64.StdEncoding.DecodeString(encodedText)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(encryptedData) < gcmNonceSize {
+	textBytes, err := json.Marshal(token)
+	if err != nil {
+		return nil, err
+	}
+
+	enc, err := cipher.Encrypt(textBytes)
+	if err != nil {
+		return nil, err
+	}
+	return enc, nil
+}
+
+func decryptToken(encrypted []byte, key []byte) (*oauth2.Token, error) {
+	if len(encrypted) < gcmNonceSize {
 		return nil, errors.New("malformed token")
 	}
 
@@ -42,7 +38,7 @@ func decryptToken(encodedText string, key []byte) (*oauth2.Token, error) {
 		return nil, err
 	}
 
-	plaintext, err := cipher.Decrypt(encryptedData)
+	plaintext, err := cipher.Decrypt(encrypted)
 	if err != nil {
 		return nil, err
 	}

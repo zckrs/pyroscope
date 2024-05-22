@@ -20,13 +20,19 @@ message GithubLoginRequest {
 }
 
 message GithubLoginResponse {
-  string cookie = 1;
+  GithubToken token = 1;
 }
 
 message GithubRefreshRequest {}
 
 message GithubRefreshResponse {
-  string cookie = 1;
+  GithubToken token = 1;
+}
+
+message GithubToken {
+  string metadata = 1;
+  int64 tokenExpiry = 2;
+  int64 refreshExpiry = 3;
 }
 
 message GetFileRequest {
